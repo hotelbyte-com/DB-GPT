@@ -1,10 +1,8 @@
 [system]
-# Load language from environment variable(It is set by the hook)
 language = "${env:DBGPT_LANG:-en}"
 api_keys = []
 encrypt_key = "your_secret_key"
 
-# Server Configurations
 [service.web]
 host = "0.0.0.0"
 port = 5670
@@ -20,14 +18,43 @@ persist_path = "pilot/data"
 
 # Model Configurations
 [models]
-[[models.llms]]
-name = "${env:LLM_MODEL_NAME:-gpt-4o}"
-provider = "${env:LLM_MODEL_PROVIDER:-proxy/openai}"
-api_base = "${env:OPENAI_API_BASE:-https://api.openai.com/v1}"
-api_key = "${env:OPENAI_API_KEY}"
 
+# ── Default: MiniMax-M2.7 (international) ──
+[[models.llms]]
+name = "${env:LLM_MODEL_NAME:-MiniMax-M2.7}"
+provider = "proxy/openai"
+api_base = "https://api.minimax.io/v1"
+api_key = "sk-cp-0_0ttCtA8Cji9XcP1LT4r-5y-3ri9jpfsX-7U2S2VMqNj8CmJ-ZHeI8kEvAgi4-vCAiOig8udwJxS2eU9_BzcJmPUrhooEyWiUt6XfjP_K84uGAGXoj_HRc"
+
+# ── kimi-for-coding (本地代理) ──
+[[models.llms]]
+name = "kimi-for-coding"
+provider = "proxy/openai"
+api_base = "http://kimi.hotelbyte.com:3000/v1"
+api_key = "sk-kimi-nBxlKgUbdIbyUwnaUcL3urlkNQ1Le4fS7rZr6vun5igHIipwqf80nJDK4fvMJHqN"
+
+# ── glm-4.7 (z.ai coding plan) ──
+[[models.llms]]
+name = "glm-4.7"
+provider = "proxy/openai"
+api_base = "https://api.z.ai/api/coding/paas/v4/"
+api_key = "63d4b6a542c7422b97d56a0c98b99d2a.UIWMIEpwYCuL5SY4"
+
+# ── deepseek-v4-flash (fast, cheap) ──
+[[models.llms]]
+name = "deepseek-v4-flash"
+provider = "proxy/deepseek"
+api_base = "https://api.deepseek.com/v1"
+api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
+
+# ── deepseek-v4-pro (stronger reasoning) ──
+[[models.llms]]
+name = "deepseek-v4-pro"
+provider = "proxy/deepseek"
+api_base = "https://api.deepseek.com/v1"
+api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
+
+# Embedding: Ollama local (nomic-embed-text, 768-dim)
 [[models.embeddings]]
-name = "${env:EMBEDDING_MODEL_NAME:-text-embedding-3-small}"
-provider = "${env:EMBEDDING_MODEL_PROVIDER:-proxy/openai}"
-api_url = "${env:EMBEDDING_MODEL_API_URL:-https://api.openai.com/v1/embeddings}"
-api_key = "${env:OPENAI_API_KEY}"
+name = "nomic-embed-text"
+provider = "proxy/ollama"
