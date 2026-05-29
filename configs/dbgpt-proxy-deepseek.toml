@@ -29,7 +29,7 @@ name = "deepseek-v4-pro"
 provider = "proxy/deepseek"
 # Disable V4-Pro thinking mode so ReAct responses stay parseable.
 thinking_enabled = false
-api_key = "your_deepseek_api_key"
+api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
 
 [[models.embeddings]]
 name = "BAAI/bge-large-zh-v1.5"
