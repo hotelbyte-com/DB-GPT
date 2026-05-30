@@ -29,7 +29,6 @@ _SKIP_DIRS = {
 
 
 def _is_readable(path: Path) -> bool:
-    """Check if a file is safe and useful to read."""
     if not path.is_file():
         return False
     if path.stat().st_size > 1024 * 1024:
@@ -41,7 +40,6 @@ def _is_readable(path: Path) -> bool:
 
 
 def _collect_files(root: Path, pattern: str = "*") -> List[str]:
-    """Collect readable files matching a glob pattern."""
     results = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
@@ -55,17 +53,31 @@ def _collect_files(root: Path, pattern: str = "*") -> List[str]:
     return results[:100]
 
 
+def _pick(kwargs, *names, default=None):
+    """Pick first non-None value from kwargs by any alias."""
+    for name in names:
+        if name in kwargs and kwargs[name] is not None:
+            return kwargs[name]
+    return default
+
+
 @tool(
     description="Read the full contents of a single file in the hotel-be project. "
     "Use this to inspect source code, configs, or documentation.",
+    args={
+        "file_path": {
+            "type": "string",
+            "description": "File path relative to project root, e.g. 'agent/config/llm.go'",
+            "required": True,
+        },
+    },
 )
-def hotelbe_read_file(relative_path: str) -> str:
-    """Read the contents of a file in the hotel-be project.
+def hotelbe_read_file(**kwargs) -> str:
+    file_path = _pick(kwargs, "file_path", "relative_path", "path", "filename")
+    if not file_path:
+        return json.dumps({"error": "file_path is required"}, ensure_ascii=False)
 
-    Args:
-        relative_path: Relative path from the hotel-be root, e.g. 'agent/config/llm.go'.
-    """
-    target = _KNOWLEDGE_ROOT / relative_path
+    target = _KNOWLEDGE_ROOT / file_path
     try:
         target.resolve().relative_to(_KNOWLEDGE_ROOT.resolve())
     except ValueError:
@@ -73,11 +85,11 @@ def hotelbe_read_file(relative_path: str) -> str:
 
     if not target.exists():
         return json.dumps(
-            {"error": f"File not found: {relative_path}"}, ensure_ascii=False
+            {"error": f"File not found: {file_path}"}, ensure_ascii=False
         )
     if not _is_readable(target):
         return json.dumps(
-            {"error": f"File is not readable or too large: {relative_path}"},
+            {"error": f"File is not readable or too large: {file_path}"},
             ensure_ascii=False,
         )
 
@@ -87,7 +99,7 @@ def hotelbe_read_file(relative_path: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     return json.dumps(
-        {"path": relative_path, "size": len(content), "content": content},
+        {"path": file_path, "size": len(content), "content": content},
         ensure_ascii=False,
     )
 
@@ -95,13 +107,17 @@ def hotelbe_read_file(relative_path: str) -> str:
 @tool(
     description="List files in the hotel-be project matching a glob pattern. "
     "Use this to discover files before reading them.",
+    args={
+        "pattern": {
+            "type": "string",
+            "description": "Glob pattern, e.g. '*.go', '**/*.md', 'agent/**/*.go'",
+            "required": False,
+            "default": "*.go",
+        },
+    },
 )
-def hotelbe_list_files(pattern: str = "*.go") -> str:
-    """List files in the hotel-be project matching a glob pattern.
-
-    Args:
-        pattern: Glob pattern, e.g. '*.go', '**/*.md', 'agent/**/*.go'.
-    """
+def hotelbe_list_files(**kwargs) -> str:
+    pattern = _pick(kwargs, "pattern", "glob_pattern", "match", default="*.go")
     files = _collect_files(_KNOWLEDGE_ROOT, pattern)
     return json.dumps(
         {"pattern": pattern, "count": len(files), "files": files},
@@ -112,14 +128,28 @@ def hotelbe_list_files(pattern: str = "*.go") -> str:
 @tool(
     description="Search for files in hotel-be whose content contains a keyword. "
     "Use this to find files related to a topic before reading them.",
+    args={
+        "query": {
+            "type": "string",
+            "description": "The search query keyword",
+            "required": True,
+        },
+        "max_results": {
+            "type": "integer",
+            "description": "Maximum number of results (default 20)",
+            "required": False,
+            "default": 20,
+        },
+    },
 )
-def hotelbe_search_files(keyword: str, max_results: int = 20) -> str:
-    """Search for files in hotel-be whose content contains a keyword.
+def hotelbe_search_files(**kwargs) -> str:
+    query = _pick(kwargs, "query", "keyword", "search", "q", "term")
+    if not query:
+        return json.dumps({"error": "query/keyword is required"}, ensure_ascii=False)
+    max_results = _pick(kwargs, "max_results", "limit", "count", default=20)
+    if isinstance(max_results, str):
+        max_results = int(max_results)
 
-    Args:
-        keyword: The keyword to search for.
-        max_results: Maximum number of matching files to return (default 20).
-    """
     results = []
     for dirpath, dirnames, filenames in os.walk(_KNOWLEDGE_ROOT):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
@@ -129,11 +159,11 @@ def hotelbe_search_files(keyword: str, max_results: int = 20) -> str:
                 continue
             try:
                 content = full_path.read_text(encoding="utf-8", errors="replace")
-                if keyword in content:
+                if query in content:
                     rel = full_path.relative_to(_KNOWLEDGE_ROOT)
                     lines = content.splitlines()
                     match_line = next(
-                        (i + 1 for i, line in enumerate(lines) if keyword in line),
+                        (i + 1 for i, line in enumerate(lines) if query in line),
                         0,
                     )
                     results.append(
@@ -153,7 +183,7 @@ def hotelbe_search_files(keyword: str, max_results: int = 20) -> str:
             break
 
     return json.dumps(
-        {"keyword": keyword, "count": len(results), "matches": results},
+        {"query": query, "count": len(results), "matches": results},
         ensure_ascii=False,
     )
 
@@ -161,13 +191,19 @@ def hotelbe_search_files(keyword: str, max_results: int = 20) -> str:
 @tool(
     description="Search for a Go symbol (function, struct, interface, method) "
     "in hotel-be source code. Returns file paths and matching line contexts.",
+    args={
+        "symbol": {
+            "type": "string",
+            "description": "The symbol name, e.g. 'KnowledgeSyncConfig' or 'func Sync'",
+            "required": True,
+        },
+    },
 )
-def hotelbe_grep_code(symbol: str) -> str:
-    """Search for a Go symbol in hotel-be source.
+def hotelbe_grep_code(**kwargs) -> str:
+    symbol = _pick(kwargs, "symbol", "name", "query", "search")
+    if not symbol:
+        return json.dumps({"error": "symbol/name is required"}, ensure_ascii=False)
 
-    Args:
-        symbol: The symbol name, e.g. 'KnowledgeSyncConfig' or 'func Sync'.
-    """
     results = []
     for dirpath, dirnames, filenames in os.walk(_KNOWLEDGE_ROOT):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]

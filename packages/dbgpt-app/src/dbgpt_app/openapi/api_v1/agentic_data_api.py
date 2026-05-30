@@ -1166,13 +1166,24 @@ async def _react_agent_stream(
     if business_tools:
         desc_lines = []
         for bt in business_tools:
-            name = getattr(bt, "name", None) or getattr(bt, "__name__", str(bt))
-            doc = getattr(bt, "__doc__", "") or ""
-            # For @tool decorated functions, extract description from metadata
-            if hasattr(bt, "_description") and bt._description:
-                doc = bt._description
-            desc_lines.append(f"- **{name}**: {doc.strip()}" if doc.strip() else f"- **{name}**")
-        business_tool_descriptions = "\n## Registered Business Tools\nThese tools are always available. Use them FIRST when relevant.\n" + "\n".join(desc_lines)
+            ft = getattr(bt, "_tool", None)
+            if ft is not None:
+                name = ft.name
+                doc = ft.description or ""
+                arg_parts = []
+                for pname, pobj in ft.args.items():
+                    req = "required" if pobj.required else "optional"
+                    default_str = f", default={pobj.default}" if pobj.default is not None and str(pobj.default) != "_MISSING" else ""
+                    arg_parts.append(f"{pname}: {pobj.type} ({req}{default_str}) — {pobj.description}")
+                args_str = "\n    " + "\n    ".join(arg_parts) if arg_parts else ""
+                desc_lines.append(f"- **{name}**: {doc.strip()}{args_str}")
+            else:
+                name = getattr(bt, "name", None) or getattr(bt, "__name__", str(bt))
+                doc = getattr(bt, "__doc__", "") or ""
+                if hasattr(bt, "_description") and bt._description:
+                    doc = bt._description
+                desc_lines.append(f"- **{name}**: {doc.strip()}" if doc.strip() else f"- **{name}**")
+        business_tool_descriptions = "\n## Registered Business Tools\nThese tools are always available. Use them FIRST when relevant.\n\nYou MUST use these exact parameter names when calling the tools. Do NOT guess or invent parameter names.\n" + "\n".join(desc_lines)
 
     # Step 3: Load knowledge space resource if specified in ext_info
     knowledge_resources: List[Any] = []
