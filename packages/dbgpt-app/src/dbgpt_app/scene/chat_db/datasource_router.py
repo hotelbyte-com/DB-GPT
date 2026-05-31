@@ -163,3 +163,5 @@ def _token_score(text: str, question: str) -> int:
     return score
 
 
+def _tokens(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9]+", text.lower())
