@@ -291,7 +291,9 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
         space = self.get(query_request)
         if space is None:
             raise HTTPException(status_code=400, detail=f"Space {space_id} not found")
-        vector_store_connector = self.create_vector_store(space.name)
+        vector_store_connector = self._system_app.get_component(
+            ComponentType.RAG_STORAGE_MANAGER, StorageManager
+        ).create_vector_store(space.name)
         # delete vectors
         vector_store_connector.delete_vector_name(space.name)
         document_query = KnowledgeDocumentEntity(space=space.name)
@@ -358,7 +360,9 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
 
         vector_ids = docuemnt.vector_ids
         if vector_ids is not None:
-            vector_store_connector = self.create_vector_store(space.name)
+            vector_store_connector = self._system_app.get_component(
+            ComponentType.RAG_STORAGE_MANAGER, StorageManager
+        ).create_vector_store(space.name)
             # delete vector by ids
             vector_store_connector.delete_by_ids(vector_ids)
         # delete chunks

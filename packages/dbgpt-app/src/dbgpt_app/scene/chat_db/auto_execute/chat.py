@@ -7,6 +7,7 @@ from dbgpt.util.executor_utils import blocking_func_to_async
 from dbgpt.util.tracer import root_tracer, trace
 from dbgpt_app.scene import BaseChat, ChatScene
 from dbgpt_app.scene.base_chat import ChatParam
+from dbgpt_app.scene.chat_db.datasource_router import resolve_chat_data_source
 from dbgpt_app.scene.chat_db.auto_execute.config import ChatWithDBExecuteConfig
 from dbgpt_serve.core.config import GPTsAppCommonConfig
 from dbgpt_serve.datasource.manages import ConnectorManager
@@ -32,7 +33,12 @@ class ChatWithDbAutoExecute(BaseChat):
             - model_name:(str) llm model name
             - select_param:(str) dbname
         """
-        self.db_name = chat_param.select_param
+        self.db_name = resolve_chat_data_source(
+            chat_param.select_param,
+            chat_param.real_user_input().last_text,
+            system_app,
+        )
+        chat_param.select_param = self.db_name
         self.curr_config = chat_param.real_app_config(ChatWithDBExecuteConfig)
         super().__init__(chat_param=chat_param, system_app=system_app)
         if not self.db_name:
