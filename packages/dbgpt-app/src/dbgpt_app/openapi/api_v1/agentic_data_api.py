@@ -922,6 +922,57 @@ def _sse_event(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _react_agent_database_name(
+    dialogue: ConversationVo, user_input: str, resolver: Optional[Any] = None
+) -> Optional[str]:
+    """Resolve the concrete datasource for ReAct without requiring UI selection.
+
+    ReAct remains the execution strategy. Datasource selection is delegated to
+    the same logical chat_data router used by DB-GPT's database chat scenes, so
+    clients can pass a stable logical ``select_param`` such as ``hotel-be``
+    instead of binding ReAct to a user-selected physical database.
+    """
+
+    if dialogue.ext_info and isinstance(dialogue.ext_info, dict):
+        explicit_database = _optional_str(dialogue.ext_info.get("database_name"))
+        if explicit_database:
+            return explicit_database
+
+    select_param = _optional_str(dialogue.select_param)
+    if not select_param:
+        return None
+
+    if resolver is None:
+        from dbgpt_app.scene.chat_db.datasource_router import resolve_chat_data_source
+
+        resolver = resolve_chat_data_source
+
+    try:
+        resolved = _optional_str(resolver(select_param, user_input, CFG.SYSTEM_APP))
+        if resolved:
+            if resolved != select_param:
+                logger.info(
+                    "Resolved ReAct datasource select_param=%s to database=%s",
+                    select_param,
+                    resolved,
+                )
+            return resolved
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve ReAct datasource from select_param=%s",
+            select_param,
+            exc_info=exc,
+        )
+    return select_param
+
+
 async def _react_agent_stream(
     dialogue: ConversationVo,
 ) -> AsyncGenerator[str, None]:
@@ -964,7 +1015,7 @@ async def _react_agent_stream(
             or dialogue.ext_info.get("knowledge_space_name")
             or dialogue.ext_info.get("knowledge_space_id")
         )
-        database_name = dialogue.ext_info.get("database_name")
+    database_name = _react_agent_database_name(dialogue, user_input)
 
     def build_step(title: str, detail: str, phase: str = None):
         nonlocal step
