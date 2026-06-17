@@ -2,7 +2,7 @@ import json
 import re
 import time
 import uuid
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -28,6 +28,7 @@ from dbgpt_app.openapi.api_v1.api_v1 import (
     __new_conversation,
     get_chat_flow,
     get_executor,
+    get_worker_manager,
     stream_generator,
 )
 from dbgpt_app.scene import BaseChat, ChatParam, ChatScene
@@ -93,6 +94,10 @@ async def chat_completions(
     check_chat_request(request)
     if request.conv_uid is None:
         request.conv_uid = str(uuid.uuid4())
+    if request.chat_mode == ChatMode.CHAT_DATA.value:
+        mongo_response = await _try_mongo_chat_data(request)
+        if mongo_response is not None:
+            return JSONResponse(mongo_response)
     if request.chat_mode == ChatMode.CHAT_APP.value:
         if request.stream is False:
             raise HTTPException(
@@ -165,6 +170,40 @@ async def chat_completions(
                 }
             },
         )
+
+
+async def _try_mongo_chat_data(
+    request: ChatCompletionRequestBody,
+) -> Optional[Dict[str, Any]]:
+    try:
+        from dbgpt_ext.datasource.nosql.mongo_chat_data import MongoChatDataRouter
+    except ImportError:
+        return None
+
+    router = MongoChatDataRouter.from_env()
+    if not router.can_handle(request.chat_param):
+        return None
+    if request.stream:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "configured Mongo chat_data apps do not support stream",
+                    "type": "invalid_request_error",
+                    "param": "stream",
+                    "code": "invalid_request_error",
+                }
+            },
+        )
+    return await router.answer(
+        chat_param=request.chat_param,
+        prompt=request.single_prompt(),
+        model=request.model,
+        worker_manager=get_worker_manager(),
+        temperature=request.temperature,
+        max_new_tokens=request.max_new_tokens,
+        conv_uid=request.conv_uid,
+    )
 
 
 async def get_chat_instance(

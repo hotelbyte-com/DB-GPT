@@ -107,7 +107,9 @@ class ClaudeLLMClient(ProxyLLMClient):
         self._client = client
         self._model = model
         self._api_key = self._resolve_env_vars(api_key)
-        api_base or os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        self._api_base = api_base or os.environ.get(
+            "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+        )
         self._api_base = self._resolve_env_vars(self._api_base)
         self._proxies = proxies
         self._timeout = timeout
