@@ -343,9 +343,29 @@ def _inline_system_messages(
     first_message = inlined[0]
     if first_message.get("role") == "user":
         first_content = first_message.get("content") or ""
-        first_message["content"] = f"{system_text}\n\n{first_content}"
+        first_message["content"] = _format_inlined_system(system_text, first_content)
         return inlined
-    return [{"role": "user", "content": system_text}, *inlined]
+    return [
+        {
+            "role": "user",
+            "content": _format_inlined_system(system_text, ""),
+        },
+        *inlined,
+    ]
+
+
+def _format_inlined_system(system_text: str, user_text: str) -> str:
+    if user_text:
+        return (
+            "System instructions (follow silently; do not summarize or restate):\n"
+            f"{system_text}\n\n"
+            "User request:\n"
+            f"{user_text}"
+        )
+    return (
+        "System instructions (follow silently; do not summarize or restate):\n"
+        f"{system_text}"
+    )
 
 
 class ClaudeProxyTokenizer(ProxyTokenizer):

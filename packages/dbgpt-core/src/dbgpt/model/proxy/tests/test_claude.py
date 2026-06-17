@@ -33,11 +33,27 @@ def test_inline_system_messages_prefixes_first_user_message():
 
     inlined = _inline_system_messages(messages, ["be careful"])
 
-    assert inlined == [{"role": "user", "content": "be careful\n\nanswer the question"}]
+    assert inlined == [
+        {
+            "role": "user",
+            "content": (
+                "System instructions (follow silently; do not summarize or restate):\n"
+                "be careful\n\n"
+                "User request:\n"
+                "answer the question"
+            ),
+        }
+    ]
     assert messages == [{"role": "user", "content": "answer the question"}]
 
 
 def test_inline_system_messages_preserves_prompt_when_only_system_exists():
     assert _inline_system_messages([], ["be careful"]) == [
-        {"role": "user", "content": "be careful"}
+        {
+            "role": "user",
+            "content": (
+                "System instructions (follow silently; do not summarize or restate):\n"
+                "be careful"
+            ),
+        }
     ]
