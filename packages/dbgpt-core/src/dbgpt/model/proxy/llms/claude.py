@@ -76,9 +76,23 @@ async def claude_generate_stream(
     context_len=2048,
 ) -> AsyncIterator[ModelOutput]:
     client: ClaudeLLMClient = cast(ClaudeLLMClient, model.proxy_llm_client)
-    request = parse_model_request(params, client.default_model, stream=True)
+    stream = _request_stream_enabled(params)
+    request = parse_model_request(params, client.default_model, stream=stream)
+    if not stream:
+        yield await client.generate(request)
+        return
     async for r in client.generate_stream(request):
         yield r
+
+
+def _request_stream_enabled(params: Dict[str, Any]) -> bool:
+    context = params.get("context")
+    if isinstance(context, dict) and "stream" in context:
+        return bool(context.get("stream"))
+    stream = params.get("stream")
+    if stream is not None:
+        return bool(stream)
+    return True
 
 
 class ClaudeLLMClient(ProxyLLMClient):
@@ -352,8 +366,29 @@ class ClaudeProxyTokenizer(ProxyTokenizer):
                     messages=request.messages,
                 )
             )
-        results = await run_async_tasks(tasks, self.concurrency_limit)
-        return results
+        try:
+            results = await run_async_tasks(tasks, self.concurrency_limit)
+        except Exception:
+            logger.warning(
+                "Claude beta token counting failed; falling back to local tokenizer",
+                exc_info=True,
+            )
+            return self.count_token(model_name, prompts)
+        return [_token_count_value(result) for result in results]
+
+
+def _token_count_value(result: Any) -> int:
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        value = result.get("input_tokens")
+        if value is None:
+            value = result.get("tokens")
+        return int(value or 0)
+    value = getattr(result, "input_tokens", None)
+    if value is not None:
+        return int(value)
+    return int(result)
 
 
 register_proxy_model_adapter(
