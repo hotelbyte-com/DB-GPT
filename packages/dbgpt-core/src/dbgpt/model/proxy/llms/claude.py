@@ -231,15 +231,12 @@ class ClaudeLLMClient(ProxyLLMClient):
     ) -> ModelOutput:
         request = self.local_covert_message(request, message_converter)
         messages, system_messages = request.split_messages()
+        messages = _inline_system_messages(messages, system_messages)
         payload = self._build_request(request)
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
         try:
-            if len(system_messages) > 1:
-                raise ValueError("Claude only supports single system message")
-            if system_messages:
-                payload["system"] = system_messages[0]
             if "max_tokens" not in payload:
                 max_tokens = 1024
             else:
@@ -279,15 +276,12 @@ class ClaudeLLMClient(ProxyLLMClient):
     ) -> AsyncIterator[ModelOutput]:
         request = self.local_covert_message(request, message_converter)
         messages, system_messages = request.split_messages()
+        messages = _inline_system_messages(messages, system_messages)
         payload = self._build_request(request, stream=True)
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
         try:
-            if len(system_messages) > 1:
-                raise ValueError("Claude only supports single system message")
-            if system_messages:
-                payload["system"] = system_messages[0]
             if "max_tokens" not in payload:
                 max_tokens = 1024
             else:
@@ -332,6 +326,26 @@ class ClaudeLLMClient(ProxyLLMClient):
             eg. get real context length from the openai api.
         """
         return self.context_length
+
+
+def _inline_system_messages(
+    messages: List[Dict[str, Any]], system_messages: List[str]
+) -> List[Dict[str, Any]]:
+    if not system_messages:
+        return messages
+    system_text = "\n\n".join(message for message in system_messages if message)
+    if not system_text:
+        return messages
+    if not messages:
+        return [{"role": "user", "content": system_text}]
+
+    inlined = [dict(message) for message in messages]
+    first_message = inlined[0]
+    if first_message.get("role") == "user":
+        first_content = first_message.get("content") or ""
+        first_message["content"] = f"{system_text}\n\n{first_content}"
+        return inlined
+    return [{"role": "user", "content": system_text}, *inlined]
 
 
 class ClaudeProxyTokenizer(ProxyTokenizer):
