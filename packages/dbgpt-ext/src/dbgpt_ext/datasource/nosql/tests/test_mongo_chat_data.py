@@ -143,7 +143,9 @@ def test_interpret_prompt_keeps_runtime_rules_as_context_not_answer_target():
         {"source": "mongodb.ITDU.ITDU_PLCData", "avg_chill_speed": 52.006},
     )
 
-    assert [message["role"] for message in messages] == ["user"]
+    assert [message["role"] for message in messages] == [
+        mongo_chat_data.ModelMessageRoleType.HUMAN
+    ]
     content = messages[0]["content"]
     assert "直接回答用户问题，不要复述规则" in content
     assert "上下文约束（只遵守，不要复述）" in content

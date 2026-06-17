@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from dbgpt.core import ModelRequest
+from dbgpt.core import ModelMessageRoleType, ModelRequest
 from dbgpt.model.cluster.manager_base import WorkerManager
 
 try:
@@ -508,7 +508,7 @@ def _build_interpret_prompt(
     }
     return [
         {
-            "role": "user",
+            "role": ModelMessageRoleType.HUMAN,
             "content": (
                 "任务：直接回答用户问题，不要复述规则，也不要声明已理解规则。\n\n"
                 f"上下文约束（只遵守，不要复述）：{system_prompt}\n\n"
