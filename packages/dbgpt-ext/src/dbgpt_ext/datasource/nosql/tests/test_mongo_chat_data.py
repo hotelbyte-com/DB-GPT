@@ -2,6 +2,7 @@ from dbgpt_ext.datasource.nosql import mongo_chat_data
 
 
 def test_router_loads_project_neutral_mongo_apps(monkeypatch):
+    monkeypatch.setenv("MONGO_TEST_DB", "runtime_itdu")
     monkeypatch.setenv(
         "DBGPT_MONGO_CHAT_DATA_CONFIG",
         """
@@ -9,7 +10,7 @@ def test_router_loads_project_neutral_mongo_apps(monkeypatch):
           "apps": {
             "manufacturing": {
               "uri": "${env:MONGO_TEST_URI:-mongodb://127.0.0.1:27017}",
-              "database": "ITDU",
+              "database": "${env:MONGO_TEST_DB:-ITDU}",
               "collection": "ITDU_PLCData",
               "source": "mongodb.ITDU.ITDU_PLCData",
               "timeField": "timestamp",
@@ -33,6 +34,7 @@ def test_router_loads_project_neutral_mongo_apps(monkeypatch):
     assert router.can_handle("manufacturing")
     assert router.can_handle("hotel")
     assert not router.can_handle("unknown")
+    assert router._apps["manufacturing"].database == "runtime_itdu"
 
 
 def test_configured_app_queries_mongo_with_configured_metrics(monkeypatch):

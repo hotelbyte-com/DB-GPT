@@ -68,9 +68,9 @@ class MongoChatDataApp:
         return cls(
             name=name,
             uri=_resolve_env(raw.get("uri") or "mongodb://127.0.0.1:27017"),
-            database=str(raw.get("database") or ""),
-            collection=str(raw.get("collection") or ""),
-            source=str(raw.get("source") or ""),
+            database=_resolve_env(raw.get("database") or ""),
+            collection=_resolve_env(raw.get("collection") or ""),
+            source=_resolve_env(raw.get("source") or ""),
             time_field=str(raw.get("timeField") or raw.get("time_field") or "timestamp"),
             group_field=str(raw.get("groupField") or raw.get("group_field") or ""),
             row_defaults=dict(raw.get("rowDefaults") or raw.get("row_defaults") or {}),

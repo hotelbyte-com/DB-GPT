@@ -160,12 +160,21 @@ class ClaudeLLMClient(ProxyLLMClient):
         from anthropic import AsyncAnthropic
 
         if self._client is None:
-            self._client = AsyncAnthropic(
+            kwargs = dict(
                 api_key=self._api_key,
                 base_url=self._api_base,
-                proxies=self._proxies,
                 timeout=self._timeout,
             )
+            if self._proxies:
+                kwargs["proxies"] = self._proxies
+            try:
+                self._client = AsyncAnthropic(**kwargs)
+            except TypeError as exc:
+                if self._proxies and "proxies" in str(exc):
+                    kwargs.pop("proxies", None)
+                    self._client = AsyncAnthropic(**kwargs)
+                else:
+                    raise
         return self._client
 
     @property
