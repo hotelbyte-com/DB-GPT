@@ -121,3 +121,31 @@ def test_configured_app_queries_mongo_with_configured_metrics(monkeypatch):
     assert summary["source"] == "mongodb.ITDU.ITDU_PLCData"
     assert summary["sample_count"] == 438758
     assert summary["avg_thickness"] == 25.308
+
+
+def test_interpret_prompt_keeps_runtime_rules_as_context_not_answer_target():
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "metrics": [{"name": "sample_count", "op": "count"}],
+            "prompt": "只能解释事实，执行动作需要人工确认。",
+        },
+    )
+
+    messages = mongo_chat_data._build_interpret_prompt(
+        app,
+        "冷辊速度是什么意思？",
+        [{"station": "Pur_Aoi", "avg_chill_speed": 52.006}],
+        {"source": "mongodb.ITDU.ITDU_PLCData", "avg_chill_speed": 52.006},
+    )
+
+    assert [message["role"] for message in messages] == ["user"]
+    content = messages[0]["content"]
+    assert "直接回答用户问题，不要复述规则" in content
+    assert "上下文约束（只遵守，不要复述）" in content
+    assert "用户问题：冷辊速度是什么意思？" in content
+    assert "avg_chill_speed" in content

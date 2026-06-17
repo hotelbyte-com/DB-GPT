@@ -507,10 +507,11 @@ def _build_interpret_prompt(
         "rows": rows,
     }
     return [
-        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
+                "任务：直接回答用户问题，不要复述规则，也不要声明已理解规则。\n\n"
+                f"上下文约束（只遵守，不要复述）：{system_prompt}\n\n"
                 f"用户问题：{user_question}\n\n"
                 f"Mongo 查询事实（JSON）：{_compact_json(facts)}\n\n"
                 "请用用户问题的语言直接回答，解释关键指标含义、当前数值和治理边界。"
