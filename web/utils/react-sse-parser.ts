@@ -40,6 +40,12 @@ export interface SSEStepMetaEvent {
   action_input?: any;
 }
 
+export interface SSEStepThoughtEvent {
+  type: 'step.thought';
+  id: string;
+  content: string;
+}
+
 export interface SSEStepDoneEvent {
   type: 'step.done';
   id: string;
@@ -70,6 +76,7 @@ export type SSEEvent =
   | SSEStepStartEvent
   | SSEStepChunkEvent
   | SSEStepMetaEvent
+  | SSEStepThoughtEvent
   | SSEStepDoneEvent
   | SSEContextStatusEvent
   | SSEFinalEvent
@@ -127,6 +134,9 @@ export class ReActSSEState {
       case 'step.meta':
         this.handleStepMeta(event);
         break;
+      case 'step.thought':
+        this.handleStepThought(event);
+        break;
       case 'step.done':
         this.handleStepDone(event);
         break;
@@ -179,6 +189,12 @@ export class ReActSSEState {
     if (event.action_input !== undefined) {
       step.actionInput = event.action_input;
     }
+  }
+
+  private handleStepThought(event: SSEStepThoughtEvent): void {
+    const step = this.steps.get(event.id);
+    if (!step) return;
+    step.thought = (step.thought || '') + event.content;
   }
 
   private handleStepDone(event: SSEStepDoneEvent): void {
