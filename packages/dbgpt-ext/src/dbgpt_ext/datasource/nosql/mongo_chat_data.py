@@ -683,6 +683,8 @@ def _validate_add_fields(
     allowed_outputs = set(_derived_output_fields(app))
     if app.group_label:
         allowed_outputs.add(app.group_label)
+    if app.group_field:
+        allowed_outputs.add(app.group_field)
     added = []
     for field_name, expression in add_fields.items():
         if str(field_name).startswith("$") or "." in str(field_name):

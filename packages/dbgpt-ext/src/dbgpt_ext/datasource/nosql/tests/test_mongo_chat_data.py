@@ -141,7 +141,7 @@ def test_configured_app_executes_llm_query_plan_with_runtime_guards(monkeypatch)
                     },
                     {
                       "$addFields": {
-                        "station": "$_id",
+                        "machineId": "$_id",
                         "alarm_count": {"$add": ["$spa000_bool_count", 0]}
                       }
                     },
@@ -177,7 +177,7 @@ def test_configured_app_executes_llm_query_plan_with_runtime_guards(monkeypatch)
     }
     assert fake.pipeline[2]["$group"]["avg_thickness"] == {"$avg": "$AvgThk"}
     assert fake.pipeline[3]["$addFields"] == {
-        "station": "$_id",
+        "machineId": "$_id",
         "alarm_count": {"$add": ["$spa000_bool_count", 0]},
     }
     assert fake.pipeline[4] == {"$sort": {"alarm_count": -1}}
