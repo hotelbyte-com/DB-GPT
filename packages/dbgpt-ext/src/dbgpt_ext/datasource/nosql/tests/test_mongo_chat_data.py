@@ -139,7 +139,13 @@ def test_configured_app_executes_llm_query_plan_with_runtime_guards(monkeypatch)
                         }
                       }
                     },
-                    {"$sort": {"sample_count": -1}},
+                    {
+                      "$addFields": {
+                        "station": "$_id",
+                        "alarm_count": {"$add": ["$spa000_bool_count", 0]}
+                      }
+                    },
+                    {"$sort": {"alarm_count": -1}},
                     {"$limit": 999}
                   ],
                   "reason": "Group requested equipment readings by machineId."
@@ -170,6 +176,11 @@ def test_configured_app_executes_llm_query_plan_with_runtime_guards(monkeypatch)
         }
     }
     assert fake.pipeline[2]["$group"]["avg_thickness"] == {"$avg": "$AvgThk"}
+    assert fake.pipeline[3]["$addFields"] == {
+        "station": "$_id",
+        "alarm_count": {"$add": ["$spa000_bool_count", 0]},
+    }
+    assert fake.pipeline[4] == {"$sort": {"alarm_count": -1}}
     assert fake.pipeline[-1] == {"$limit": 10}
     assert rows == [
         {
@@ -229,6 +240,46 @@ def test_query_plan_rejects_unconfigured_line_filter():
                 model="MiniMax-M3",
                 worker_manager=worker_manager,
                 conv_uid="run-2",
+            )
+        )
+
+
+def test_query_plan_rejects_unconfigured_add_fields_output():
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "timeField": "timestamp",
+            "groupField": "machineId",
+            "metrics": [{"name": "sample_count", "op": "count"}],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                """
+                {
+                  "pipeline": [
+                    {"$group": {"_id": "$machineId", "sample_count": {"$sum": 1}}},
+                    {"$addFields": {"line": "L1"}}
+                  ],
+                  "reason": "Wrongly invented a line field."
+                }
+                """
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="line"):
+        asyncio.run(
+            app.plan_query(
+                prompt="factory=F1 line=L1",
+                model="MiniMax-M3",
+                worker_manager=worker_manager,
+                conv_uid="run-4",
             )
         )
 

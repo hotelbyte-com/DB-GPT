@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover - reported as a runtime configuration gap.
 CONFIG_FILE_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG_FILE"
 CONFIG_JSON_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG"
 
-_ALLOWED_STAGES = {"$match", "$sort", "$group", "$limit"}
+_ALLOWED_STAGES = {"$match", "$sort", "$group", "$addFields", "$limit"}
 _ALLOWED_MATCH_OPERATORS = {"$gte", "$gt", "$lte", "$lt", "$eq", "$in", "$ne"}
 _ALLOWED_GROUP_OPERATORS = {
     "$sum",
@@ -52,6 +52,14 @@ _ALLOWED_EXPRESSION_OPERATORS = _ALLOWED_GROUP_OPERATORS | {
     "$lte",
     "$and",
     "$or",
+    "$add",
+    "$subtract",
+    "$multiply",
+    "$divide",
+    "$ifNull",
+    "$ne",
+    "$in",
+    "$not",
 }
 
 
@@ -457,6 +465,7 @@ def _build_query_plan_prompt(
         "allowedStages": sorted(_ALLOWED_STAGES),
         "allowedMatchOperators": sorted(_ALLOWED_MATCH_OPERATORS),
         "allowedGroupOperators": sorted(_ALLOWED_GROUP_OPERATORS),
+        "allowedExpressionOperators": sorted(_ALLOWED_EXPRESSION_OPERATORS),
     }
     return [
         {
@@ -567,6 +576,7 @@ def _int_limit(value: Any) -> int:
 def _validate_pipeline(app: MongoChatDataApp, pipeline: List[Dict[str, Any]]) -> None:
     if not pipeline:
         raise ValueError("Mongo chat_data query plan pipeline is empty")
+    available_fields = set(_source_fields(app))
     for stage in pipeline:
         if not isinstance(stage, Mapping) or len(stage) != 1:
             raise ValueError(
@@ -578,9 +588,13 @@ def _validate_pipeline(app: MongoChatDataApp, pipeline: List[Dict[str, Any]]) ->
         if stage_name == "$match":
             _validate_match(app, payload)
         elif stage_name == "$sort":
-            _validate_sort(app, payload)
+            _validate_sort(app, payload, available_fields)
         elif stage_name == "$group":
-            _validate_group(app, payload)
+            _validate_group(app, payload, available_fields)
+            available_fields = {"_id"} | set(_metric_output_fields(app))
+        elif stage_name == "$addFields":
+            new_fields = _validate_add_fields(app, payload, available_fields)
+            available_fields.update(new_fields)
         elif stage_name == "$limit":
             limit = _int_limit(payload)
             if limit > app.row_limit:
@@ -617,12 +631,12 @@ def _validate_match_literal(value: Any) -> None:
             _validate_match_literal(item)
 
 
-def _validate_sort(app: MongoChatDataApp, sort: Any) -> None:
+def _validate_sort(
+    app: MongoChatDataApp, sort: Any, available_fields: Optional[Iterable[str]] = None
+) -> None:
     if not isinstance(sort, Mapping):
         raise ValueError("Mongo chat_data $sort must be an object")
-    allowed_fields = (
-        set(_source_fields(app)) | set(_metric_output_fields(app)) | {"_id"}
-    )
+    allowed_fields = set(available_fields or _source_fields(app)) | {"_id"}
     for field_name, direction in sort.items():
         if field_name not in allowed_fields:
             raise ValueError(
@@ -632,12 +646,14 @@ def _validate_sort(app: MongoChatDataApp, sort: Any) -> None:
             raise ValueError("Mongo chat_data $sort direction must be 1 or -1")
 
 
-def _validate_group(app: MongoChatDataApp, group: Any) -> None:
+def _validate_group(
+    app: MongoChatDataApp, group: Any, available_fields: Optional[Iterable[str]] = None
+) -> None:
     if not isinstance(group, Mapping):
         raise ValueError("Mongo chat_data $group must be an object")
     if "_id" not in group:
         raise ValueError("Mongo chat_data $group must include _id")
-    _validate_expression(app, group.get("_id"))
+    _validate_expression(app, group.get("_id"), available_fields)
     metric_fields = set(_metric_output_fields(app))
     for field_name, expression in group.items():
         if field_name == "_id":
@@ -656,11 +672,39 @@ def _validate_group(app: MongoChatDataApp, group: Any) -> None:
             raise ValueError(
                 f"Mongo chat_data $group operator {operator!r} is not allowed"
             )
-        _validate_expression(app, expression)
+        _validate_expression(app, expression, available_fields)
 
 
-def _validate_expression(app: MongoChatDataApp, expression: Any) -> None:
-    allowed_fields = set(_source_fields(app)) | {"_id"}
+def _validate_add_fields(
+    app: MongoChatDataApp, add_fields: Any, available_fields: Iterable[str]
+) -> List[str]:
+    if not isinstance(add_fields, Mapping):
+        raise ValueError("Mongo chat_data $addFields must be an object")
+    allowed_outputs = set(_derived_output_fields(app))
+    if app.group_label:
+        allowed_outputs.add(app.group_label)
+    added = []
+    for field_name, expression in add_fields.items():
+        if str(field_name).startswith("$") or "." in str(field_name):
+            raise ValueError(
+                f"Mongo chat_data $addFields output {field_name!r} is not allowed"
+            )
+        if field_name not in allowed_outputs:
+            raise ValueError(
+                f"Mongo chat_data $addFields output {field_name!r} is not "
+                "configured"
+            )
+        _validate_expression(app, expression, available_fields)
+        added.append(str(field_name))
+    return added
+
+
+def _validate_expression(
+    app: MongoChatDataApp,
+    expression: Any,
+    available_fields: Optional[Iterable[str]] = None,
+) -> None:
+    allowed_fields = set(available_fields or _source_fields(app)) | {"_id"}
     if isinstance(expression, str):
         if expression.startswith("$") and expression[1:] not in allowed_fields:
             raise ValueError(
@@ -669,7 +713,7 @@ def _validate_expression(app: MongoChatDataApp, expression: Any) -> None:
         return
     if isinstance(expression, list):
         for item in expression:
-            _validate_expression(app, item)
+            _validate_expression(app, item, allowed_fields)
         return
     if isinstance(expression, Mapping):
         for key, value in expression.items():
@@ -677,7 +721,7 @@ def _validate_expression(app: MongoChatDataApp, expression: Any) -> None:
                 raise ValueError(
                     f"Mongo chat_data expression operator {key!r} is not allowed"
                 )
-            _validate_expression(app, value)
+            _validate_expression(app, value, allowed_fields)
 
 
 def _source_fields(app: MongoChatDataApp) -> List[str]:
@@ -694,6 +738,10 @@ def _source_fields(app: MongoChatDataApp) -> List[str]:
 
 def _metric_output_fields(app: MongoChatDataApp) -> List[str]:
     return [name for name in _iter_metric_names(app.metrics) if name]
+
+
+def _derived_output_fields(app: MongoChatDataApp) -> List[str]:
+    return [name for name in _iter_metric_names(app.derived) if name]
 
 
 def _query_plan_payload(
