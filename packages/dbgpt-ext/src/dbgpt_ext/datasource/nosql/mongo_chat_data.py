@@ -1,9 +1,9 @@
 """Config-driven MongoDB chat_data runtime.
 
 This module is intentionally project-neutral. Each project binds `chat_param` to
-a Mongo database/collection through configuration; the runtime here only knows
-how to read Mongo and hand the resulting facts to the requested DB-GPT model for
-interpretation.
+a Mongo database/collection through configuration; the DB-GPT model plans the
+read-only aggregation, while this runtime validates, guards, executes, and
+hands the resulting facts back to the model for interpretation.
 """
 
 from __future__ import annotations
@@ -11,13 +11,16 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field as dc_field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from dataclasses import field as dc_field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from dbgpt.core import ModelMessageRoleType, ModelRequest
-from dbgpt.model.cluster.manager_base import WorkerManager
+
+if TYPE_CHECKING:
+    from dbgpt.model.cluster.manager_base import WorkerManager
 
 try:
     from pymongo import MongoClient
@@ -27,6 +30,29 @@ except Exception:  # pragma: no cover - reported as a runtime configuration gap.
 
 CONFIG_FILE_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG_FILE"
 CONFIG_JSON_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG"
+
+_ALLOWED_STAGES = {"$match", "$sort", "$group", "$limit"}
+_ALLOWED_MATCH_OPERATORS = {"$gte", "$gt", "$lte", "$lt", "$eq", "$in", "$ne"}
+_ALLOWED_GROUP_OPERATORS = {
+    "$sum",
+    "$first",
+    "$last",
+    "$avg",
+    "$min",
+    "$max",
+    "$stdDevPop",
+    "$stdDevSamp",
+}
+_ALLOWED_EXPRESSION_OPERATORS = _ALLOWED_GROUP_OPERATORS | {
+    "$cond",
+    "$eq",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$and",
+    "$or",
+}
 
 
 @dataclass
@@ -46,6 +72,12 @@ class MongoSummaryMetricSpec:
 
 
 @dataclass
+class MongoQueryPlan:
+    pipeline: List[Dict[str, Any]]
+    reason: str = ""
+
+
+@dataclass
 class MongoChatDataApp:
     name: str
     uri: str
@@ -54,6 +86,7 @@ class MongoChatDataApp:
     source: str
     time_field: str = "timestamp"
     group_field: str = ""
+    filter_fields: List[str] = dc_field(default_factory=list)
     row_defaults: Dict[str, Any] = dc_field(default_factory=dict)
     group_label: str = "group"
     metrics: List[MongoMetricSpec] = dc_field(default_factory=list)
@@ -71,8 +104,14 @@ class MongoChatDataApp:
             database=_resolve_env(raw.get("database") or ""),
             collection=_resolve_env(raw.get("collection") or ""),
             source=_resolve_env(raw.get("source") or ""),
-            time_field=str(raw.get("timeField") or raw.get("time_field") or "timestamp"),
+            time_field=str(
+                raw.get("timeField") or raw.get("time_field") or "timestamp"
+            ),
             group_field=str(raw.get("groupField") or raw.get("group_field") or ""),
+            filter_fields=[
+                str(v)
+                for v in raw.get("filterFields") or raw.get("filter_fields") or []
+            ],
             row_defaults=dict(raw.get("rowDefaults") or raw.get("row_defaults") or {}),
             group_label=str(raw.get("groupLabel") or raw.get("group_label") or "group"),
             metrics=[
@@ -118,31 +157,42 @@ class MongoChatDataApp:
                 missing.append(name)
         if missing:
             raise ValueError(
-                f"Mongo chat_data app {self.name!r} missing config: {', '.join(missing)}"
+                f"Mongo chat_data app {self.name!r} missing config: "
+                f"{', '.join(missing)}"
             )
         if not self.metrics:
             raise ValueError(f"Mongo chat_data app {self.name!r} has no metrics")
 
-    def query(self, prompt: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        collection = _collection(self)
-        match = _match_window(self, prompt, collection)
-        sort_metric = (
-            "sample_count"
-            if any(m.name == "sample_count" for m in self.metrics)
-            else None
+    async def plan_query(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        worker_manager: WorkerManager,
+        conv_uid: Optional[str],
+    ) -> Tuple[MongoQueryPlan, Dict[str, int]]:
+        model_output = await worker_manager.generate(
+            _query_plan_request_dict(
+                app=self,
+                prompt=prompt,
+                model=model,
+                conv_uid=conv_uid,
+            )
         )
-        pipeline: List[Dict[str, Any]] = [
-            {"$match": match},
-            {"$sort": {self.time_field: 1}},
-            {"$group": _build_group_stage(self)},
-        ]
-        if sort_metric:
-            pipeline.append({"$sort": {sort_metric: -1}})
-        pipeline.append({"$limit": self.row_limit})
+        if not model_output.success:
+            _raise_model_error(model, model_output.text)
+        query_plan = _parse_query_plan(model_output.text)
+        query_plan.pipeline = _guard_pipeline(self, query_plan.pipeline, prompt)
+        _validate_pipeline(self, query_plan.pipeline)
+        return query_plan, _usage_from_model(model_output.usage)
 
+    def query(
+        self, query_plan: MongoQueryPlan
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        collection = _collection(self)
         rows = [
             _normalize_row(self, row)
-            for row in collection.aggregate(pipeline, allowDiskUse=True)
+            for row in collection.aggregate(query_plan.pipeline, allowDiskUse=True)
         ]
         return rows, _summarize(self, rows)
 
@@ -154,6 +204,7 @@ class MongoChatDataApp:
         worker_manager: WorkerManager,
         rows: List[Dict[str, Any]],
         summary: Dict[str, Any],
+        query_plan: MongoQueryPlan,
         temperature: Optional[float],
         max_new_tokens: Optional[int],
         conv_uid: Optional[str],
@@ -164,6 +215,7 @@ class MongoChatDataApp:
                 prompt=prompt,
                 rows=rows,
                 summary=summary,
+                query_plan=query_plan,
                 model=model,
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
@@ -211,17 +263,26 @@ class MongoChatDataRouter:
         conv_uid: Optional[str] = None,
     ) -> Dict[str, Any]:
         app = self._apps[chat_param]
-        rows, summary = app.query(prompt)
+        query_plan, plan_usage = await app.plan_query(
+            prompt=prompt,
+            model=model,
+            worker_manager=worker_manager,
+            conv_uid=conv_uid,
+        )
+        rows, summary = app.query(query_plan)
         answer, usage = await app.interpret(
             prompt=prompt,
             model=model,
             worker_manager=worker_manager,
             rows=rows,
             summary=summary,
+            query_plan=query_plan,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
             conv_uid=conv_uid,
         )
+        combined_usage = _merge_usage(plan_usage, usage)
+        query_plan_payload = _query_plan_payload(app, query_plan)
         return {
             "id": conv_uid or f"mongo-chat-data-{chat_param}",
             "object": "chat.completion",
@@ -234,15 +295,18 @@ class MongoChatDataRouter:
                 "source": app.source,
                 "chat_param": chat_param,
                 "summary": summary,
+                "queryPlan": query_plan_payload,
                 "rows": rows,
             },
             "raw": {
                 "source": app.source,
                 "chat_param": chat_param,
                 "summary": summary,
+                "queryPlan": query_plan_payload,
                 "rows": rows,
             },
-            "usage": usage or {
+            "usage": combined_usage
+            or {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
@@ -300,6 +364,12 @@ def _jsonable(value: Any) -> Any:
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     return value
 
 
@@ -352,36 +422,299 @@ def _find_user_question(prompt: str) -> str:
     return text
 
 
+def _build_query_plan_prompt(
+    app: MongoChatDataApp, prompt: str
+) -> List[Dict[str, str]]:
+    schema = {
+        "chatDataApp": app.name,
+        "source": app.source,
+        "database": app.database,
+        "collection": app.collection,
+        "timeField": app.time_field,
+        "groupField": app.group_field,
+        "groupLabel": app.group_label,
+        "rowLimit": app.row_limit,
+        "sourceFields": _source_fields(app),
+        "filterFields": app.filter_fields,
+        "metrics": [
+            {
+                "name": spec.name,
+                "op": spec.op,
+                "field": spec.field,
+                "fields": spec.fields,
+            }
+            for spec in app.metrics
+        ],
+        "derived": [
+            {
+                "name": spec.name,
+                "op": spec.op,
+                "field": spec.field,
+                "fields": spec.fields,
+            }
+            for spec in app.derived
+        ],
+        "allowedStages": sorted(_ALLOWED_STAGES),
+        "allowedMatchOperators": sorted(_ALLOWED_MATCH_OPERATORS),
+        "allowedGroupOperators": sorted(_ALLOWED_GROUP_OPERATORS),
+    }
+    return [
+        {
+            "role": ModelMessageRoleType.HUMAN,
+            "content": (
+                "你是 DB-GPT chat_data 查询规划器。请根据用户问题和 Mongo schema 生成"
+                "只读 Mongo aggregation 查询计划。\n\n"
+                "硬性规则：\n"
+                "1. 只返回 JSON，不要 Markdown，不要解释。\n"
+                '2. JSON 结构必须是 {"pipeline": [...], "reason": "..."}。\n'
+                "3. pipeline 只能使用 schema.allowedStages 中的 stage，不能使用 $out、"
+                "$merge、$lookup、$function、$where 或写入类操作。\n"
+                "4. 只能引用 schema.sourceFields 中存在的源字段；如果用户上下文提到"
+                " factory/line/asset 但 schema 没有对应字段，不要添加这些过滤条件。\n"
+                "5. 如果用户 prompt 中提供时间窗，必须在 timeField 上使用这个时间窗。\n"
+                "6. 聚合输出字段名优先使用 schema.metrics.name，"
+                "便于下游生成稳定 artifact。\n\n"
+                f"Mongo schema（JSON）：{_compact_json(schema)}\n\n"
+                f"用户 prompt：{prompt}\n\n"
+                "请只返回 JSON。"
+            ),
+        }
+    ]
+
+
+def _parse_query_plan(text: str) -> MongoQueryPlan:
+    raw = _parse_json_object(text)
+    pipeline = raw.get("pipeline")
+    if not isinstance(pipeline, list):
+        raise ValueError("Mongo chat_data query plan must contain a pipeline list")
+    for stage in pipeline:
+        if not isinstance(stage, Mapping):
+            raise ValueError("Mongo chat_data pipeline stages must be objects")
+    reason = raw.get("reason")
+    return MongoQueryPlan(
+        pipeline=[dict(stage) for stage in pipeline],
+        reason=str(reason or ""),
+    )
+
+
+def _parse_json_object(text: str) -> Dict[str, Any]:
+    candidate = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.S | re.I)
+    if fenced:
+        candidate = fenced.group(1)
+    elif not candidate.startswith("{"):
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            candidate = candidate[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Mongo chat_data model did not return valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Mongo chat_data query plan must be a JSON object")
+    return parsed
+
+
+def _guard_pipeline(
+    app: MongoChatDataApp, pipeline: List[Dict[str, Any]], prompt: str
+) -> List[Dict[str, Any]]:
+    guarded = [_copy_stage(stage) for stage in pipeline]
+    start, end = _extract_time_window(prompt)
+    if start and end:
+        time_clause = {app.time_field: {"$gte": start, "$lte": end}}
+        if guarded and "$match" in guarded[0]:
+            match = dict(guarded[0]["$match"])
+            match[app.time_field] = time_clause[app.time_field]
+            guarded[0] = {"$match": match}
+        else:
+            guarded.insert(0, {"$match": time_clause})
+    return _cap_pipeline_limit(app, guarded)
+
+
+def _copy_stage(stage: Mapping[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(stage, default=str))
+
+
+def _cap_pipeline_limit(
+    app: MongoChatDataApp, pipeline: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    capped: List[Dict[str, Any]] = []
+    saw_limit = False
+    for stage in pipeline:
+        if "$limit" in stage:
+            if not saw_limit:
+                capped.append(
+                    {"$limit": min(_int_limit(stage["$limit"]), app.row_limit)}
+                )
+                saw_limit = True
+            continue
+        capped.append(stage)
+    if not saw_limit:
+        capped.append({"$limit": app.row_limit})
+    return capped
+
+
+def _int_limit(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Mongo chat_data $limit must be an integer")
+    limit = int(value)
+    if limit < 1:
+        raise ValueError("Mongo chat_data $limit must be positive")
+    return limit
+
+
+def _validate_pipeline(app: MongoChatDataApp, pipeline: List[Dict[str, Any]]) -> None:
+    if not pipeline:
+        raise ValueError("Mongo chat_data query plan pipeline is empty")
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            raise ValueError(
+                "Mongo chat_data pipeline stages must be single-key objects"
+            )
+        stage_name, payload = next(iter(stage.items()))
+        if stage_name not in _ALLOWED_STAGES:
+            raise ValueError(f"Mongo chat_data stage {stage_name!r} is not allowed")
+        if stage_name == "$match":
+            _validate_match(app, payload)
+        elif stage_name == "$sort":
+            _validate_sort(app, payload)
+        elif stage_name == "$group":
+            _validate_group(app, payload)
+        elif stage_name == "$limit":
+            limit = _int_limit(payload)
+            if limit > app.row_limit:
+                raise ValueError("Mongo chat_data $limit exceeds configured row limit")
+
+
+def _validate_match(app: MongoChatDataApp, match: Any) -> None:
+    if not isinstance(match, Mapping):
+        raise ValueError("Mongo chat_data $match must be an object")
+    allowed_fields = set(_source_fields(app))
+    for field_name, value in match.items():
+        if str(field_name).startswith("$"):
+            raise ValueError("Mongo chat_data logical $match operators are not allowed")
+        if field_name not in allowed_fields:
+            raise ValueError(
+                f"Mongo chat_data $match field {field_name!r} is not in schema"
+            )
+        if isinstance(value, Mapping):
+            for operator, operator_value in value.items():
+                if operator not in _ALLOWED_MATCH_OPERATORS:
+                    raise ValueError(
+                        f"Mongo chat_data $match operator {operator!r} is not allowed"
+                    )
+                _validate_match_literal(operator_value)
+        else:
+            _validate_match_literal(value)
+
+
+def _validate_match_literal(value: Any) -> None:
+    if isinstance(value, Mapping):
+        raise ValueError("Mongo chat_data nested $match values are not allowed")
+    if isinstance(value, list):
+        for item in value:
+            _validate_match_literal(item)
+
+
+def _validate_sort(app: MongoChatDataApp, sort: Any) -> None:
+    if not isinstance(sort, Mapping):
+        raise ValueError("Mongo chat_data $sort must be an object")
+    allowed_fields = (
+        set(_source_fields(app)) | set(_metric_output_fields(app)) | {"_id"}
+    )
+    for field_name, direction in sort.items():
+        if field_name not in allowed_fields:
+            raise ValueError(
+                f"Mongo chat_data $sort field {field_name!r} is not in schema"
+            )
+        if direction not in (1, -1):
+            raise ValueError("Mongo chat_data $sort direction must be 1 or -1")
+
+
+def _validate_group(app: MongoChatDataApp, group: Any) -> None:
+    if not isinstance(group, Mapping):
+        raise ValueError("Mongo chat_data $group must be an object")
+    if "_id" not in group:
+        raise ValueError("Mongo chat_data $group must include _id")
+    _validate_expression(app, group.get("_id"))
+    metric_fields = set(_metric_output_fields(app))
+    for field_name, expression in group.items():
+        if field_name == "_id":
+            continue
+        if field_name not in metric_fields:
+            raise ValueError(
+                f"Mongo chat_data $group output {field_name!r} is not a "
+                "configured metric"
+            )
+        if not isinstance(expression, Mapping) or len(expression) != 1:
+            raise ValueError(
+                "Mongo chat_data $group metric expressions must be one-op objects"
+            )
+        operator = next(iter(expression.keys()))
+        if operator not in _ALLOWED_GROUP_OPERATORS:
+            raise ValueError(
+                f"Mongo chat_data $group operator {operator!r} is not allowed"
+            )
+        _validate_expression(app, expression)
+
+
+def _validate_expression(app: MongoChatDataApp, expression: Any) -> None:
+    allowed_fields = set(_source_fields(app)) | {"_id"}
+    if isinstance(expression, str):
+        if expression.startswith("$") and expression[1:] not in allowed_fields:
+            raise ValueError(
+                f"Mongo chat_data field reference {expression!r} is not in schema"
+            )
+        return
+    if isinstance(expression, list):
+        for item in expression:
+            _validate_expression(app, item)
+        return
+    if isinstance(expression, Mapping):
+        for key, value in expression.items():
+            if str(key).startswith("$") and key not in _ALLOWED_EXPRESSION_OPERATORS:
+                raise ValueError(
+                    f"Mongo chat_data expression operator {key!r} is not allowed"
+                )
+            _validate_expression(app, value)
+
+
+def _source_fields(app: MongoChatDataApp) -> List[str]:
+    fields = {app.time_field}
+    if app.group_field:
+        fields.add(app.group_field)
+    fields.update(app.filter_fields)
+    for spec in app.metrics:
+        if spec.field:
+            fields.add(spec.field)
+        fields.update(spec.fields)
+    return sorted(field for field in fields if field)
+
+
+def _metric_output_fields(app: MongoChatDataApp) -> List[str]:
+    return [name for name in _iter_metric_names(app.metrics) if name]
+
+
+def _query_plan_payload(
+    app: MongoChatDataApp, query_plan: MongoQueryPlan
+) -> Dict[str, Any]:
+    return {
+        "source": app.source,
+        "database": app.database,
+        "collection": app.collection,
+        "pipeline": _jsonable(query_plan.pipeline),
+        "reason": query_plan.reason,
+        "generatedBy": "llm",
+    }
+
+
 def _iter_metric_names(specs: Iterable[MongoMetricSpec]) -> List[str]:
     names = []
     for spec in specs:
         if spec.name:
             names.append(spec.name)
     return names
-
-
-def _pipeline_expr(spec: MongoMetricSpec, time_field: str) -> Optional[Dict[str, Any]]:
-    if not spec.name:
-        return None
-    if spec.op == "count":
-        return {"$sum": 1}
-    if spec.op == "first":
-        return {"$first": f"${spec.field or time_field}"}
-    if spec.op == "last":
-        return {"$last": f"${spec.field or time_field}"}
-    if spec.op == "avg" and spec.field:
-        return {"$avg": f"${spec.field}"}
-    if spec.op == "min" and spec.field:
-        return {"$min": f"${spec.field}"}
-    if spec.op == "max" and spec.field:
-        return {"$max": f"${spec.field}"}
-    if spec.op == "stdDevPop" and spec.field:
-        return {"$stdDevPop": f"${spec.field}"}
-    if spec.op == "sumBoolTrue" and spec.field:
-        return {"$sum": {"$cond": [{"$eq": [f"${spec.field}", True]}, 1, 0]}}
-    if spec.op == "sum" and spec.field:
-        return {"$sum": f"${spec.field}"}
-    return None
 
 
 def _derived_value(spec: MongoMetricSpec, row: Mapping[str, Any]) -> Any:
@@ -430,31 +763,20 @@ def _usage_from_model(model_usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
     }
 
 
+def _merge_usage(*usages: Dict[str, int]) -> Dict[str, int]:
+    merged = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for usage in usages:
+        for key in merged:
+            merged[key] += int((usage or {}).get(key) or 0)
+    return merged
+
+
 def _collection(app: MongoChatDataApp):
     if MongoClient is None:
         raise RuntimeError("pymongo is not installed in DB-GPT runtime")
     client = MongoClient(app.uri, serverSelectionTimeoutMS=5000, socketTimeoutMS=15000)
     client.admin.command("ping")
     return client[app.database][app.collection]
-
-
-def _match_window(app: MongoChatDataApp, prompt: str, collection) -> Dict[str, Any]:
-    start, end = _extract_time_window(prompt)
-    if start and end:
-        return {app.time_field: {"$gte": start, "$lte": end}}
-
-    latest = collection.find_one(
-        sort=[(app.time_field, -1)], projection={app.time_field: 1}
-    )
-    latest_ts = latest.get(app.time_field) if latest else None
-    if isinstance(latest_ts, datetime):
-        return {
-            app.time_field: {
-                "$gte": latest_ts - timedelta(hours=app.default_window_hours),
-                "$lte": latest_ts,
-            }
-        }
-    return {}
 
 
 def _normalize_row(app: MongoChatDataApp, row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -482,17 +804,12 @@ def _summarize(app: MongoChatDataApp, rows: List[Dict[str, Any]]) -> Dict[str, A
     return summary
 
 
-def _build_group_stage(app: MongoChatDataApp) -> Dict[str, Any]:
-    group: Dict[str, Any] = {"_id": f"${app.group_field}" if app.group_field else None}
-    for spec in app.metrics:
-        expr = _pipeline_expr(spec, app.time_field)
-        if expr is not None:
-            group[spec.name] = expr
-    return group
-
-
 def _build_interpret_prompt(
-    app: MongoChatDataApp, prompt: str, rows: List[Dict[str, Any]], summary: Dict[str, Any]
+    app: MongoChatDataApp,
+    prompt: str,
+    rows: List[Dict[str, Any]],
+    summary: Dict[str, Any],
+    query_plan: MongoQueryPlan,
 ) -> List[Dict[str, str]]:
     user_question = _find_user_question(prompt)
     system_prompt = app.prompt or (
@@ -504,6 +821,7 @@ def _build_interpret_prompt(
         "chatDataApp": app.name,
         "source": app.source,
         "summary": summary,
+        "executedQuery": _query_plan_payload(app, query_plan),
         "rows": rows,
     }
     return [
@@ -515,9 +833,28 @@ def _build_interpret_prompt(
                 f"用户问题：{user_question}\n\n"
                 f"Mongo 查询事实（JSON）：{_compact_json(facts)}\n\n"
                 "请用用户问题的语言直接回答，解释关键指标含义、当前数值和治理边界。"
+                "如果提到查询、SQL 或 Mongo pipeline，只能引用 facts.executedQuery；"
+                "不要编造未执行的过滤字段、SQL 或 Mongo 语句。"
             ),
         },
     ]
+
+
+def _query_plan_request_dict(
+    *,
+    app: MongoChatDataApp,
+    prompt: str,
+    model: str,
+    conv_uid: Optional[str],
+) -> Dict[str, Any]:
+    req = ModelRequest(
+        model=model,
+        messages=_build_query_plan_prompt(app, prompt),
+        temperature=0.0,
+        max_new_tokens=1024,
+        span_id=f"{conv_uid}:query-plan" if conv_uid else None,
+    )
+    return req.to_dict()
 
 
 def _model_request_dict(
@@ -526,6 +863,7 @@ def _model_request_dict(
     prompt: str,
     rows: List[Dict[str, Any]],
     summary: Dict[str, Any],
+    query_plan: MongoQueryPlan,
     model: str,
     temperature: Optional[float],
     max_new_tokens: Optional[int],
@@ -533,7 +871,7 @@ def _model_request_dict(
 ) -> Dict[str, Any]:
     req = ModelRequest(
         model=model,
-        messages=_build_interpret_prompt(app, prompt, rows, summary),
+        messages=_build_interpret_prompt(app, prompt, rows, summary, query_plan),
         temperature=temperature,
         max_new_tokens=max_new_tokens or 1024,
         span_id=conv_uid,
