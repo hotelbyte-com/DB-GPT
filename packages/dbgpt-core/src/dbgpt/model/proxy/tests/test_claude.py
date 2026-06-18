@@ -1,0 +1,59 @@
+"""Tests for Claude-compatible proxy helpers."""
+
+from types import SimpleNamespace
+
+from dbgpt.model.proxy.llms.claude import (
+    _inline_system_messages,
+    _request_stream_enabled,
+    _token_count_value,
+)
+
+
+def test_request_stream_enabled_honors_context_stream_false():
+    assert _request_stream_enabled({"context": {"stream": False}}) is False
+
+
+def test_request_stream_enabled_defaults_to_true_for_streaming_adapter():
+    assert _request_stream_enabled({}) is True
+
+
+def test_token_count_value_accepts_anthropic_sdk_object():
+    result = SimpleNamespace(input_tokens=42)
+
+    assert _token_count_value(result) == 42
+
+
+def test_token_count_value_accepts_legacy_int_and_dict():
+    assert _token_count_value(7) == 7
+    assert _token_count_value({"input_tokens": 9}) == 9
+
+
+def test_inline_system_messages_prefixes_first_user_message():
+    messages = [{"role": "user", "content": "answer the question"}]
+
+    inlined = _inline_system_messages(messages, ["be careful"])
+
+    assert inlined == [
+        {
+            "role": "user",
+            "content": (
+                "System instructions (follow silently; do not summarize or restate):\n"
+                "be careful\n\n"
+                "User request:\n"
+                "answer the question"
+            ),
+        }
+    ]
+    assert messages == [{"role": "user", "content": "answer the question"}]
+
+
+def test_inline_system_messages_preserves_prompt_when_only_system_exists():
+    assert _inline_system_messages([], ["be careful"]) == [
+        {
+            "role": "user",
+            "content": (
+                "System instructions (follow silently; do not summarize or restate):\n"
+                "be careful"
+            ),
+        }
+    ]

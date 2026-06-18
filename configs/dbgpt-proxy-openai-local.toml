@@ -43,14 +43,14 @@ api_key = "63d4b6a542c7422b97d56a0c98b99d2a.UIWMIEpwYCuL5SY4"
 # ── deepseek-v4-flash (fast, cheap) ──
 [[models.llms]]
 name = "deepseek-v4-flash"
-provider = "proxy/deepseek"
+provider = "proxy/openai"
 api_base = "https://api.deepseek.com/v1"
 api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
 
 # ── deepseek-v4-pro (stronger reasoning) ──
 [[models.llms]]
 name = "deepseek-v4-pro"
-provider = "proxy/deepseek"
+provider = "proxy/openai"
 api_base = "https://api.deepseek.com/v1"
 api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
 

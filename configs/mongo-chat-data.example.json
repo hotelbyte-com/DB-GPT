@@ -1,0 +1,81 @@
+{
+  "apps": {
+    "manufacturing": {
+      "uri": "${env:MFG_MONGO_URI:-mongodb://127.0.0.1:27017}",
+      "database": "${env:MFG_MONGO_DATABASE:-ITDU}",
+      "collection": "${env:MFG_MONGO_COLLECTION:-ITDU_PLCData}",
+      "source": "mongodb.ITDU.ITDU_PLCData",
+      "timeField": "timestamp",
+      "groupField": "machineId",
+      "groupLabel": "station",
+      "rowDefaults": {
+        "line": "ITDU"
+      },
+      "rowLimit": 10,
+      "defaultWindowHours": 24,
+      "metrics": [
+        { "name": "sample_count", "op": "count" },
+        { "name": "first_ts", "op": "first", "field": "timestamp" },
+        { "name": "last_ts", "op": "last", "field": "timestamp" },
+        { "name": "avg_thickness", "op": "avg", "field": "AvgThk" },
+        { "name": "min_thickness", "op": "min", "field": "AvgThk" },
+        { "name": "max_thickness", "op": "max", "field": "AvgThk" },
+        { "name": "std_thickness", "op": "stdDevPop", "field": "AvgThk" },
+        { "name": "avg_tension", "op": "avg", "field": "TenAct" },
+        { "name": "avg_chill_speed", "op": "avg", "field": "ChrDrvSpdSet" },
+        { "name": "avg_tdo_speed", "op": "avg", "field": "TdoDrvSpdSet" },
+        { "name": "avg_width", "op": "avg", "field": "PurFlmWid" },
+        { "name": "avg_cox001_pressure", "op": "avg", "field": "Cox001FilPrsFilInl" },
+        { "name": "avg_cox002_pressure", "op": "avg", "field": "Cox002FilPrsFilInl" },
+        { "name": "max_spa000_int", "op": "max", "field": "Spa000_INT" },
+        { "name": "max_spa001_int", "op": "max", "field": "Spa001_INT" },
+        { "name": "spa000_bool_count", "op": "sumBoolTrue", "field": "Spa000_BOOL" },
+        { "name": "spa001_bool_count", "op": "sumBoolTrue", "field": "Spa001_BOOL" },
+        { "name": "latest_roll", "op": "last", "field": "RolID_Act" }
+      ],
+      "derived": [
+        {
+          "name": "alarm_count",
+          "op": "sumFields",
+          "fields": ["spa000_bool_count", "spa001_bool_count"]
+        }
+      ],
+      "summaryMetrics": [
+        { "name": "sample_count", "op": "sum", "field": "sample_count" },
+        { "name": "machine_count", "op": "countRows" },
+        {
+          "name": "avg_thickness",
+          "op": "weightedAvg",
+          "field": "avg_thickness",
+          "weight": "sample_count"
+        },
+        {
+          "name": "std_thickness",
+          "op": "weightedAvg",
+          "field": "std_thickness",
+          "weight": "sample_count"
+        },
+        {
+          "name": "avg_tension",
+          "op": "weightedAvg",
+          "field": "avg_tension",
+          "weight": "sample_count"
+        },
+        {
+          "name": "avg_chill_speed",
+          "op": "weightedAvg",
+          "field": "avg_chill_speed",
+          "weight": "sample_count"
+        },
+        {
+          "name": "avg_tdo_speed",
+          "op": "weightedAvg",
+          "field": "avg_tdo_speed",
+          "weight": "sample_count"
+        },
+        { "name": "alarm_count", "op": "sum", "field": "alarm_count" }
+      ],
+      "prompt": "你是严谨的制造业数据分析助手。只能解释 Mongo 查询事实，不要编造未提供的数据；涉及停机、派工、参数修改、质量放行等执行动作时，只能给建议并明确需要人工确认。"
+    }
+  }
+}

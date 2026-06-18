@@ -141,12 +141,11 @@ async def update(
 
 @router.delete(
     "/spaces/{space_id}",
-    response_model=Result[None],
     dependencies=[Depends(check_api_key)],
 )
 async def delete(
     space_id: str, service: Service = Depends(get_service)
-) -> Result[None]:
+) -> Result:
     """Delete a Space entity
 
     Args:
@@ -319,7 +318,7 @@ async def sync_documents(
     Returns:
         ServerResponse: The response
     """
-    return Result.succ(service.sync_document(requests))
+    return Result.succ(await service.sync_document(requests))
 
 
 @router.post("/documents/batch_sync")
@@ -335,7 +334,7 @@ async def sync_documents(
     Returns:
         ServerResponse: The response
     """
-    return Result.succ(service.sync_document(requests))
+    return Result.succ(await service.sync_document(requests))
 
 
 @router.post("/documents/{document_id}/sync")
@@ -355,17 +354,16 @@ async def sync_document(
     request.doc_id = document_id
     if request.chunk_parameters is None:
         request.chunk_parameters = ChunkParameters(chunk_strategy="Automatic")
-    return Result.succ(service.sync_document([request]))
+    return Result.succ(await service.sync_document([request]))
 
 
 @router.delete(
     "/documents/{document_id}",
     dependencies=[Depends(check_api_key)],
-    response_model=Result[None],
 )
 async def delete_document(
     document_id: str, service: Service = Depends(get_service)
-) -> Result[None]:
+) -> Result:
     """Delete a Space entity
 
     Args:

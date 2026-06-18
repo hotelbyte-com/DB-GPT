@@ -76,9 +76,23 @@ async def claude_generate_stream(
     context_len=2048,
 ) -> AsyncIterator[ModelOutput]:
     client: ClaudeLLMClient = cast(ClaudeLLMClient, model.proxy_llm_client)
-    request = parse_model_request(params, client.default_model, stream=True)
+    stream = _request_stream_enabled(params)
+    request = parse_model_request(params, client.default_model, stream=stream)
+    if not stream:
+        yield await client.generate(request)
+        return
     async for r in client.generate_stream(request):
         yield r
+
+
+def _request_stream_enabled(params: Dict[str, Any]) -> bool:
+    context = params.get("context")
+    if isinstance(context, dict) and "stream" in context:
+        return bool(context.get("stream"))
+    stream = params.get("stream")
+    if stream is not None:
+        return bool(stream)
+    return True
 
 
 class ClaudeLLMClient(ProxyLLMClient):
@@ -107,7 +121,9 @@ class ClaudeLLMClient(ProxyLLMClient):
         self._client = client
         self._model = model
         self._api_key = self._resolve_env_vars(api_key)
-        api_base or os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        self._api_base = api_base or os.environ.get(
+            "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+        )
         self._api_base = self._resolve_env_vars(self._api_base)
         self._proxies = proxies
         self._timeout = timeout
@@ -158,12 +174,21 @@ class ClaudeLLMClient(ProxyLLMClient):
         from anthropic import AsyncAnthropic
 
         if self._client is None:
-            self._client = AsyncAnthropic(
+            kwargs = dict(
                 api_key=self._api_key,
                 base_url=self._api_base,
-                proxies=self._proxies,
                 timeout=self._timeout,
             )
+            if self._proxies:
+                kwargs["proxies"] = self._proxies
+            try:
+                self._client = AsyncAnthropic(**kwargs)
+            except TypeError as exc:
+                if self._proxies and "proxies" in str(exc):
+                    kwargs.pop("proxies", None)
+                    self._client = AsyncAnthropic(**kwargs)
+                else:
+                    raise
         return self._client
 
     @property
@@ -206,15 +231,12 @@ class ClaudeLLMClient(ProxyLLMClient):
     ) -> ModelOutput:
         request = self.local_covert_message(request, message_converter)
         messages, system_messages = request.split_messages()
+        messages = _inline_system_messages(messages, system_messages)
         payload = self._build_request(request)
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
         try:
-            if len(system_messages) > 1:
-                raise ValueError("Claude only supports single system message")
-            if system_messages:
-                payload["system"] = system_messages[0]
             if "max_tokens" not in payload:
                 max_tokens = 1024
             else:
@@ -254,15 +276,12 @@ class ClaudeLLMClient(ProxyLLMClient):
     ) -> AsyncIterator[ModelOutput]:
         request = self.local_covert_message(request, message_converter)
         messages, system_messages = request.split_messages()
+        messages = _inline_system_messages(messages, system_messages)
         payload = self._build_request(request, stream=True)
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
         try:
-            if len(system_messages) > 1:
-                raise ValueError("Claude only supports single system message")
-            if system_messages:
-                payload["system"] = system_messages[0]
             if "max_tokens" not in payload:
                 max_tokens = 1024
             else:
@@ -309,6 +328,46 @@ class ClaudeLLMClient(ProxyLLMClient):
         return self.context_length
 
 
+def _inline_system_messages(
+    messages: List[Dict[str, Any]], system_messages: List[str]
+) -> List[Dict[str, Any]]:
+    if not system_messages:
+        return messages
+    system_text = "\n\n".join(message for message in system_messages if message)
+    if not system_text:
+        return messages
+    if not messages:
+        return [{"role": "user", "content": system_text}]
+
+    inlined = [dict(message) for message in messages]
+    first_message = inlined[0]
+    if first_message.get("role") == "user":
+        first_content = first_message.get("content") or ""
+        first_message["content"] = _format_inlined_system(system_text, first_content)
+        return inlined
+    return [
+        {
+            "role": "user",
+            "content": _format_inlined_system(system_text, ""),
+        },
+        *inlined,
+    ]
+
+
+def _format_inlined_system(system_text: str, user_text: str) -> str:
+    if user_text:
+        return (
+            "System instructions (follow silently; do not summarize or restate):\n"
+            f"{system_text}\n\n"
+            "User request:\n"
+            f"{user_text}"
+        )
+    return (
+        "System instructions (follow silently; do not summarize or restate):\n"
+        f"{system_text}"
+    )
+
+
 class ClaudeProxyTokenizer(ProxyTokenizer):
     def __init__(self, client: "AsyncAnthropic", concurrency_limit: int = 10):
         self.client = client
@@ -341,8 +400,29 @@ class ClaudeProxyTokenizer(ProxyTokenizer):
                     messages=request.messages,
                 )
             )
-        results = await run_async_tasks(tasks, self.concurrency_limit)
-        return results
+        try:
+            results = await run_async_tasks(tasks, self.concurrency_limit)
+        except Exception:
+            logger.warning(
+                "Claude beta token counting failed; falling back to local tokenizer",
+                exc_info=True,
+            )
+            return self.count_token(model_name, prompts)
+        return [_token_count_value(result) for result in results]
+
+
+def _token_count_value(result: Any) -> int:
+    if isinstance(result, int):
+        return result
+    if isinstance(result, dict):
+        value = result.get("input_tokens")
+        if value is None:
+            value = result.get("tokens")
+        return int(value or 0)
+    value = getattr(result, "input_tokens", None)
+    if value is not None:
+        return int(value)
+    return int(result)
 
 
 register_proxy_model_adapter(
