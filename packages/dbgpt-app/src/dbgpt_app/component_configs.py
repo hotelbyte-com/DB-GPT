@@ -110,12 +110,7 @@ def _initialize_resource_manager(system_app: SystemApp):
     )
     from dbgpt.agent.expand.resources.search_tool import baidu_search
     from dbgpt.agent.resource.base import ResourceType
-    from dbgpt_ext.datasource.tool_hotelbe import (
-        hotelbe_grep_code,
-        hotelbe_list_files,
-        hotelbe_read_file,
-        hotelbe_search_files,
-    )
+    from dbgpt_ext.datasource.tool_repo_rg import repo_rg
     from dbgpt_ext.datasource.tool_redis import (
         redis_get,
         redis_hget,
@@ -155,11 +150,8 @@ def _initialize_resource_manager(system_app: SystemApp):
     rm.register_resource(resource_instance=get_current_host_cpu_status)
     rm.register_resource(resource_instance=get_current_host_memory_status)
     rm.register_resource(resource_instance=get_current_host_system_load)
-    # Register hotel-be file read tools
-    rm.register_resource(resource_instance=hotelbe_read_file)
-    rm.register_resource(resource_instance=hotelbe_list_files)
-    rm.register_resource(resource_instance=hotelbe_search_files)
-    rm.register_resource(resource_instance=hotelbe_grep_code)
+    # Register repository retrieval tools
+    rm.register_resource(resource_instance=repo_rg)
     # Register Redis read-only tools
     rm.register_resource(resource_instance=redis_get)
     rm.register_resource(resource_instance=redis_hget)
