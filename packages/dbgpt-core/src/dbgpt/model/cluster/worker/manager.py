@@ -634,19 +634,34 @@ class LocalWorkerManager(WorkerManager):
                     )
                     worker_run_data.stop_event.clear()
                     if worker_run_data.worker_params.register and self.register_func:
-                        # Register worker to controller
-                        await self.register_func(worker_run_data)
-                        if (
-                            worker_run_data.worker_params.send_heartbeat
-                            and self.send_heartbeat_func
-                        ):
-                            asyncio.create_task(
-                                _async_heartbeat_sender(
-                                    worker_run_data,
-                                    worker_run_data.worker_params.heartbeat_interval,
-                                    self.send_heartbeat_func,
-                                )
+                        # Register worker to controller. Registration is a
+                        # best-effort control-plane step: the worker has already
+                        # started above. A registration hiccup (e.g. the embedded
+                        # controller briefly returning 502 during concurrent
+                        # startup) must NOT fail the whole worker / trigger a
+                        # webserver shutdown that takes down healthy models too.
+                        try:
+                            await self.register_func(worker_run_data)
+                        except Exception as reg_err:
+                            logger.warning(
+                                "%s register to controller failed (worker is "
+                                "loaded but may be unavailable for routed "
+                                "requests): %s",
+                                info,
+                                reg_err,
                             )
+                        else:
+                            if (
+                                worker_run_data.worker_params.send_heartbeat
+                                and self.send_heartbeat_func
+                            ):
+                                asyncio.create_task(
+                                    _async_heartbeat_sender(
+                                        worker_run_data,
+                                        worker_run_data.worker_params.heartbeat_interval,
+                                        self.send_heartbeat_func,
+                                    )
+                                )
                     out.message = f"{info} start successfully"
             except TimeoutException:
                 out.success = False
@@ -1077,7 +1092,31 @@ def _create_local_model_manager(
             instance = ModelInstance(
                 model_name=worker_run_data.worker_key, host=register_host, port=port
             )
-            return await client.register_instance(instance)
+            # Retry registration: in single-process startup the embedded model
+            # controller is not always accepting requests the instant workers
+            # try to register, which surfaces as HTTP 502 / connection errors.
+            # The controller becomes ready within seconds, so a bounded retry
+            # lets local embedded startup win the race instead of crashing.
+            import asyncio as _asyncio
+
+            last_err: Optional[BaseException] = None
+            for _attempt in range(10):
+                try:
+                    return await client.register_instance(instance)
+                except Exception as e:  # noqa: BLE001 - intentional retry boundary
+                    msg = str(e).lower()
+                    transient = (
+                        "502" in msg
+                        or "503" in msg
+                        or "connection" in msg
+                        or "remote request error" in msg
+                    )
+                    if not transient:
+                        raise
+                    last_err = e
+                    await _asyncio.sleep(2)
+            if last_err is not None:
+                raise last_err
 
         async def deregister_func(worker_run_data: WorkerRunData):
             instance = ModelInstance(
