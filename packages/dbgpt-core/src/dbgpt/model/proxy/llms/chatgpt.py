@@ -257,6 +257,17 @@ class OpenAILLMClient(ProxyLLMClient):
             payload["stop"] = request.stop
         if request.top_p:
             payload["top_p"] = request.top_p
+        # Disable reasoning/thinking by default. The manufacturing Data Agent
+        # interpretation path needs fast, deterministic, non-verbose answers;
+        # reasoning models otherwise emit huge thinking blobs (30s+ latency +
+        # multi-thousand-token outputs that destabilize the worker). z.ai honors
+        # {"thinking":{"type":"disabled"}} (~3s, clean output); other
+        # OpenAI-compatible providers ignore the unknown field.
+        # Callers can still override via an explicit extra_body.thinking.
+        extra_body = dict(payload.get("extra_body") or {})
+        if "thinking" not in extra_body:
+            extra_body["thinking"] = {"type": "disabled"}
+        payload["extra_body"] = extra_body
         return payload
 
     async def generate(
