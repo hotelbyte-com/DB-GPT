@@ -237,6 +237,40 @@ def _default_sql_artifact_title(display_type: str) -> str:
     return "SQL visualization"
 
 
+def _validate_hotel_be_sql_query(sql: str) -> Optional[str]:
+    sql_stripped = str(sql or "").strip().rstrip(";")
+    sql_upper = sql_stripped.upper().lstrip()
+    if not sql_upper.startswith("SELECT"):
+        return "安全限制: 仅支持 SELECT 查询。"
+    if ";" in sql_stripped:
+        return "SQL治理: 仅支持单条 SELECT 查询，不允许多语句执行。"
+
+    # Low-level SQL governance for the hotel-be data-agent datasource boundary.
+    # This is intentionally protocol parsing, not agent routing logic.
+    forbidden_match = re.search(
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|MERGE|CALL|EXEC|REPLACE|LOAD|COPY)\b",
+        sql_stripped,
+        re.I,
+    )
+    if forbidden_match:
+        return f"安全限制: 不允许执行 {forbidden_match.group(1).upper()} 语句。"
+
+    limit_matches = list(
+        re.finditer(r"\blimit\s+(\d+)(?:\s*,\s*(\d+))?\b", sql_stripped, re.I)
+    )
+    if not limit_matches:
+        return "SQL治理: 必须包含 LIMIT，且 LIMIT 不能超过 100。"
+    max_limit = max(
+        int(match.group(2) or match.group(1)) for match in limit_matches
+    )
+    if max_limit > 100:
+        return (
+            f"SQL治理: LIMIT {max_limit} 超过上限 100，"
+            "请改为 LIMIT 100 或更小后重试。"
+        )
+    return None
+
+
 def _select_connector_tools(
     connector_ids: List[str],
     connector_manager: Optional["ConnectorManager"],
@@ -1954,6 +1988,18 @@ print(json.dumps(summary, ensure_ascii=False))
 
         sql_stripped = sql.strip().rstrip(";")
         sql_upper = sql_stripped.upper().lstrip()
+        if not sql_upper.startswith("SELECT"):
+            return json.dumps(
+                {
+                    "chunks": [
+                        {
+                            "output_type": "text",
+                            "content": "安全限制: 仅支持 SELECT 查询。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         forbidden = [
             "INSERT",
             "UPDATE",
@@ -1981,6 +2027,23 @@ print(json.dumps(summary, ensure_ascii=False))
                     },
                     ensure_ascii=False,
                 )
+        governance_msg = (
+            _validate_hotel_be_sql_query(sql_stripped)
+            if is_hotel_be_data_agent
+            else None
+        )
+        if governance_msg:
+            return json.dumps(
+                {
+                    "chunks": [
+                        {
+                            "output_type": "text",
+                            "content": governance_msg,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
 
         try:
             result = database_connector.run(sql_stripped)
@@ -3381,8 +3444,8 @@ Please always respond in the same language as the user's input language.
 4. If schema, SQL execution, or live data is unavailable, terminate with a clear
    typed data/source gap. Do not invent rows or metrics.
 5. For recent-hour/day questions, SQL must include an explicit time window.
-6. For rankings, tables, breakdowns, and top-N outputs, SQL must include LIMIT.
-   For trend aggregations, include a safe LIMIT on the grouped result.
+6. For rankings, tables, breakdowns, and top-N outputs, SQL must include LIMIT <= 100.
+   For trend aggregations, include LIMIT <= 100 on the grouped result.
 
 ## SQL Tool Usage
 - Table/ranking answer: call `sql_query` with

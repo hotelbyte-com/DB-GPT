@@ -12,6 +12,7 @@ from dbgpt_app.openapi.api_v1.agentic_data_api import (
     _normalize_sql_display_type,
     _parse_connector_ids,
     _select_connector_tools,
+    _validate_hotel_be_sql_query,
 )
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,43 @@ class TestNormalizeSqlDisplayType:
         assert _normalize_sql_display_type("table") == "response_table"
         assert _normalize_sql_display_type("line_chart") == "response_line_chart"
         assert _normalize_sql_display_type("response_bar_chart") == "response_bar_chart"
+
+
+class TestHotelBeSQLGovernance:
+    def test_accepts_select_with_limit_at_or_below_100(self):
+        assert (
+            _validate_hotel_be_sql_query(
+                "SELECT DATE(update_time), COUNT(*) FROM hotel_names "
+                "WHERE update_time >= NOW() - INTERVAL 180 DAY "
+                "GROUP BY DATE(update_time) LIMIT 100"
+            )
+            is None
+        )
+
+    def test_rejects_missing_limit(self):
+        assert "LIMIT" in _validate_hotel_be_sql_query(
+            "SELECT COUNT(*) FROM hotel_names"
+        )
+
+    def test_rejects_limit_above_100(self):
+        assert "1000" in _validate_hotel_be_sql_query(
+            "SELECT * FROM hotel_names LIMIT 1000"
+        )
+
+    def test_rejects_mysql_limit_count_above_100(self):
+        assert "200" in _validate_hotel_be_sql_query(
+            "SELECT * FROM hotel_names LIMIT 10, 200"
+        )
+
+    def test_rejects_non_select(self):
+        assert "SELECT" in _validate_hotel_be_sql_query(
+            "SHOW TABLES LIMIT 10"
+        )
+
+    def test_rejects_multi_statement_select(self):
+        assert "单条" in _validate_hotel_be_sql_query(
+            "SELECT * FROM hotel_names LIMIT 10; DROP TABLE hotel_names"
+        )
 
 
 # ---------------------------------------------------------------------------
