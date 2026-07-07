@@ -271,6 +271,41 @@ def _validate_hotel_be_sql_query(sql: str) -> Optional[str]:
     return None
 
 
+def _extract_hotel_be_user_question(user_input: str) -> str:
+    text = str(user_input or "").strip()
+    if not text:
+        return ""
+
+    markers = [
+        "\n用户问题:\n",
+        "\n用户问题：\n",
+        "\nUser question:\n",
+        "\nQuestion:\n",
+        "用户问题:",
+        "用户问题：",
+        "User question:",
+        "Question:",
+    ]
+    best_index = -1
+    best_marker = ""
+    for marker in markers:
+        index = text.rfind(marker)
+        if index > best_index:
+            best_index = index
+            best_marker = marker
+    if best_index >= 0:
+        question = text[best_index + len(best_marker) :].strip()
+        if question:
+            return question
+
+    separator = "\n---\n"
+    if separator in text:
+        question = text.rsplit(separator, 1)[1].strip()
+        if question:
+            return question
+    return text
+
+
 def _select_connector_tools(
     connector_ids: List[str],
     connector_manager: Optional["ConnectorManager"],
@@ -1152,8 +1187,10 @@ async def _react_agent_stream(
             or dialogue.ext_info.get("knowledge_space_name")
             or dialogue.ext_info.get("knowledge_space_id")
         )
-    database_name = _react_agent_database_name(dialogue, user_input)
     is_hotel_be_data_agent = _is_hotel_be_data_agent_source(dialogue.ext_info)
+    if is_hotel_be_data_agent:
+        user_input = _extract_hotel_be_user_question(user_input)
+    database_name = _react_agent_database_name(dialogue, user_input)
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)

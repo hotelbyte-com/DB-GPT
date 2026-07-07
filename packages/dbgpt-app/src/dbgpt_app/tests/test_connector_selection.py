@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 from dbgpt_app.openapi.api_v1.agentic_data_api import (
+    _extract_hotel_be_user_question,
     _is_hotel_be_data_agent_source,
     _normalize_sql_display_type,
     _parse_connector_ids,
@@ -121,6 +122,22 @@ class TestHotelBeSQLGovernance:
         assert "单条" in _validate_hotel_be_sql_query(
             "SELECT * FROM hotel_names LIMIT 10; DROP TABLE hotel_names"
         )
+
+
+class TestHotelBeWrappedQuestion:
+    def test_extracts_question_after_hotel_be_marker(self):
+        wrapped = (
+            "system contract\n\n---\n用户问题:\n"
+            "使用 hotel_names 表统计每日更新。"
+        )
+        assert (
+            _extract_hotel_be_user_question(wrapped)
+            == "使用 hotel_names 表统计每日更新。"
+        )
+
+    def test_plain_question_passthrough(self):
+        question = "使用 hotel_catalog 表按 status 汇总。"
+        assert _extract_hotel_be_user_question(question) == question
 
 
 # ---------------------------------------------------------------------------
