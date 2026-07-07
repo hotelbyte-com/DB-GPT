@@ -6,7 +6,7 @@ import logging
 from contextlib import contextmanager
 from typing import ClassVar, Dict, Generic, Iterator, Optional, Type, TypeVar, Union
 
-from sqlalchemy import URL, Engine, MetaData, create_engine, inspect, orm
+from sqlalchemy import URL, Engine, MetaData, create_engine, event, inspect, orm
 from sqlalchemy.orm import (
     DeclarativeMeta,
     Session,
@@ -21,6 +21,48 @@ from dbgpt.util.string_utils import _to_str
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound="BaseModel")
+
+
+def _is_sqlite_url(db_url: Union[str, URL]) -> bool:
+    return str(db_url).startswith("sqlite:")
+
+
+def _is_sqlite_memory_url(db_url: Union[str, URL]) -> bool:
+    url = str(db_url)
+    return url in {"sqlite://", "sqlite:///:memory:"} or ":memory:" in url
+
+
+def _sqlite_engine_args(
+    db_url: Union[str, URL], engine_args: Optional[Dict]
+) -> Dict:
+    args = dict(engine_args or {})
+    if not _is_sqlite_url(db_url):
+        return args
+    connect_args = dict(args.get("connect_args") or {})
+    connect_args.setdefault("timeout", 30)
+    args["connect_args"] = connect_args
+    return args
+
+
+def _configure_sqlite_engine(engine: Engine, db_url: Union[str, URL]) -> None:
+    if not _is_sqlite_url(db_url):
+        return
+
+    use_wal = not _is_sqlite_memory_url(db_url)
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            if use_wal:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+        except Exception as exc:
+            logger.warning("Failed to configure SQLite metadata pragmas: %s", exc)
+        finally:
+            cursor.close()
 
 
 # class _QueryObject:
@@ -308,7 +350,8 @@ class DatabaseManager:
                 base.query_class = self.Query
             if not hasattr(base, "__db_manager__") or override_query_class:
                 base.__db_manager__ = self
-        self._engine = create_engine(db_url, **(engine_args or {}))
+        self._engine = create_engine(db_url, **_sqlite_engine_args(db_url, engine_args))
+        _configure_sqlite_engine(self._engine, db_url)
 
         session_options.setdefault("class_", Session)
         session_options.setdefault("query_cls", self.Query)

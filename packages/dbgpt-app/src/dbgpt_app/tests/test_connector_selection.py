@@ -8,6 +8,8 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 from dbgpt_app.openapi.api_v1.agentic_data_api import (
+    _is_hotel_be_data_agent_source,
+    _normalize_sql_display_type,
     _parse_connector_ids,
     _select_connector_tools,
 )
@@ -64,6 +66,23 @@ class TestParseConnectorIds:
         # fallback to legacy.  This matches the code: isinstance([], list)
         # is True, so the list comprehension runs and returns [].
         assert _parse_connector_ids(ext) == []
+
+
+class TestHotelBeDataAgentSource:
+    def test_exact_source_matches(self):
+        assert _is_hotel_be_data_agent_source({"source": "hotel-be-data-agent"})
+
+    def test_missing_or_other_source_does_not_match(self):
+        assert not _is_hotel_be_data_agent_source({})
+        assert not _is_hotel_be_data_agent_source({"source": "other"})
+        assert not _is_hotel_be_data_agent_source(None)
+
+
+class TestNormalizeSqlDisplayType:
+    def test_aliases_to_response_types(self):
+        assert _normalize_sql_display_type("table") == "response_table"
+        assert _normalize_sql_display_type("line_chart") == "response_line_chart"
+        assert _normalize_sql_display_type("response_bar_chart") == "response_bar_chart"
 
 
 # ---------------------------------------------------------------------------

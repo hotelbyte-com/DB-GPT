@@ -196,6 +196,47 @@ def _parse_connector_ids(ext_info: Optional[Dict[str, Any]]) -> List[str]:
     return []
 
 
+def _is_hotel_be_data_agent_source(ext_info: Optional[Dict[str, Any]]) -> bool:
+    """Return True for hotel-be's governed Data Agent ReAct stream."""
+    if not ext_info or not isinstance(ext_info, dict):
+        return False
+    return str(ext_info.get("source") or "").strip() == "hotel-be-data-agent"
+
+
+def _normalize_sql_display_type(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = normalized.removeprefix("response_")
+    aliases = {
+        "": "response_table",
+        "table": "response_table",
+        "data_table": "response_table",
+        "line": "response_line_chart",
+        "line_chart": "response_line_chart",
+        "trend": "response_line_chart",
+        "bar": "response_bar_chart",
+        "bar_chart": "response_bar_chart",
+        "column": "response_bar_chart",
+        "column_chart": "response_bar_chart",
+        "area": "response_area_chart",
+        "area_chart": "response_area_chart",
+        "pie": "response_pie_chart",
+        "pie_chart": "response_pie_chart",
+        "scatter": "response_scatter",
+        "scatter_chart": "response_scatter",
+    }
+    return aliases.get(normalized, f"response_{normalized}")
+
+
+def _default_sql_artifact_title(display_type: str) -> str:
+    if display_type == "response_table":
+        return "SQL query result"
+    if display_type == "response_line_chart":
+        return "SQL trend chart"
+    if display_type == "response_bar_chart":
+        return "SQL breakdown chart"
+    return "SQL visualization"
+
+
 def _select_connector_tools(
     connector_ids: List[str],
     connector_manager: Optional["ConnectorManager"],
@@ -1078,6 +1119,7 @@ async def _react_agent_stream(
             or dialogue.ext_info.get("knowledge_space_id")
         )
     database_name = _react_agent_database_name(dialogue, user_input)
+    is_hotel_be_data_agent = _is_hotel_be_data_agent_source(dialogue.ext_info)
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
@@ -1268,14 +1310,15 @@ async def _react_agent_stream(
     # Step 2: Get business tools from ResourceManager
     rm = get_resource_manager(CFG.SYSTEM_APP)
     business_tools: List[Any] = []
-    try:
-        # Get all registered tool resources from ResourceManager
-        tool_resources = rm._type_to_resources.get("tool", [])
-        for reg_resource in tool_resources:
-            if reg_resource.resource_instance is not None:
-                business_tools.append(reg_resource.resource_instance)
-    except Exception:
-        pass  # If no business tools, continue with empty list
+    if not is_hotel_be_data_agent:
+        try:
+            # Get all registered tool resources from ResourceManager
+            tool_resources = rm._type_to_resources.get("tool", [])
+            for reg_resource in tool_resources:
+                if reg_resource.resource_instance is not None:
+                    business_tools.append(reg_resource.resource_instance)
+        except Exception:
+            pass  # If no business tools, continue with empty list
 
     # Step 2.5: Generate business tool descriptions for prompt injection
     business_tool_descriptions = ""
@@ -1887,10 +1930,14 @@ print(json.dumps(summary, ensure_ascii=False))
     @tool(
         description=(
             "对用户选择的数据库执行 SQL 查询（仅支持 SELECT）。"
-            '参数: {"sql": "SELECT 语句"}'
+            '参数: {"sql": "SELECT 语句", '
+            '"display_type": "response_table|response_line_chart|response_bar_chart", '
+            '"title": "图表或表格标题"}'
         )
     )
-    def sql_query(sql: str) -> str:
+    def sql_query(
+        sql: str, display_type: str = "response_table", title: str = ""
+    ) -> str:
         """Execute a read-only SQL query against the selected database."""
         if database_connector is None:
             return json.dumps(
@@ -1951,6 +1998,18 @@ print(json.dumps(summary, ensure_ascii=False))
             columns = result[0]
             col_names = [str(c[0]) if isinstance(c, tuple) else str(c) for c in columns]
             rows = result[1:]
+            row_dicts = []
+            for row in rows[:50]:
+                if hasattr(row, "_mapping"):
+                    values = [row._mapping.get(col) for col in col_names]
+                else:
+                    values = list(row) if isinstance(row, (list, tuple)) else [row]
+                row_dicts.append(
+                    {
+                        col: values[index] if index < len(values) else None
+                        for index, col in enumerate(col_names)
+                    }
+                )
 
             # Build markdown table
             header = "| " + " | ".join(col_names) + " |"
@@ -1962,8 +2021,29 @@ print(json.dumps(summary, ensure_ascii=False))
             if len(rows) > 50:
                 table += f"\n\n（仅显示前 50 行，共 {len(rows)} 行）"
 
+            normalized_display = _normalize_sql_display_type(display_type)
+            artifact = {
+                "display_type": normalized_display,
+                "title": str(title or "").strip()
+                or _default_sql_artifact_title(normalized_display),
+                "sql": sql_stripped,
+                "columns": col_names,
+                "rows": row_dicts,
+                "row_count": len(rows),
+            }
+            artifact_json = json.dumps(artifact, default=str, ensure_ascii=False)
             return json.dumps(
-                {"chunks": [{"output_type": "markdown", "content": table}]},
+                {
+                    "chunks": [
+                        {"output_type": "markdown", "content": table},
+                        {
+                            "output_type": "markdown",
+                            "content": (
+                                f"```{normalized_display}\n{artifact_json}\n```"
+                            ),
+                        },
+                    ]
+                },
                 ensure_ascii=False,
             )
         except Exception as e:
@@ -3287,7 +3367,52 @@ print(json.dumps(summary, ensure_ascii=False))
     except Exception:
         pass  # graceful degradation — connector tools are optional
 
-    if is_skill_mode:
+    if is_hotel_be_data_agent:
+        workflow_prompt = f"""
+You are DB-GPT executing HotelByte's governed Data Agent live query path.
+The caller is hotel-be and ext_info.source is hotel-be-data-agent.
+Please always respond in the same language as the user's input language.
+
+## Execution Contract
+1. Use only the selected DB-GPT datasource and the `sql_query` tool.
+2. Execute at most two SELECT-only SQL queries, then call `terminate`.
+3. Do not use skills, shell/code execution, html_interpreter, todowrite, external
+   tools, fixtures, examples, synthetic rows, or demo data.
+4. If schema, SQL execution, or live data is unavailable, terminate with a clear
+   typed data/source gap. Do not invent rows or metrics.
+5. For recent-hour/day questions, SQL must include an explicit time window.
+6. For rankings, tables, breakdowns, and top-N outputs, SQL must include LIMIT.
+   For trend aggregations, include a safe LIMIT on the grouped result.
+
+## SQL Tool Usage
+- Table/ranking answer: call `sql_query` with
+  {{"display_type": "response_table", "title": "..."}}.
+- Trend answer: call `sql_query` with
+  {{"display_type": "response_line_chart", "title": "..."}}.
+- Distribution/top breakdown answer: call `sql_query` with
+  {{"display_type": "response_bar_chart", "title": "..."}}.
+
+## Final Answer Contract
+After `sql_query` returns live rows, call `terminate` with a concise final answer.
+The final answer must preserve the SQL口径: datasource/table, selected metrics,
+time window, filters, grouping, ordering, LIMIT, and row count. If the
+`sql_query` observation contains a fenced response_table/response_line_chart/
+response_bar_chart JSON block, summarize it; do not rewrite it with fabricated
+values.
+
+{database_context}
+
+## ReAct Output Format
+Must output for each interaction round:
+Thought: brief reasoning for the next database action
+Action Intention: concise user-facing step title
+Action Reason: concise reason this step is needed
+Action: The selected tool name
+Action Input: JSON tool parameters
+""".strip()
+
+        tool_pack = ToolPack([sql_query, Terminate()])
+    elif is_skill_mode:
         # Simplified prompt for skill mode - only skill-related tools +
         # html_interpreter
         workflow_prompt = f"""
@@ -3686,8 +3811,9 @@ Action Input: The JSON format of tool parameters
         template_format="jinja2",
     )
 
+    agent_max_retry_count = 6 if is_hotel_be_data_agent else 15
     agent_builder = (
-        ReActAgent(max_retry_count=15)
+        ReActAgent(max_retry_count=agent_max_retry_count)
         .bind(context)
         .bind(agent_memory)
         .bind(llm_config)
