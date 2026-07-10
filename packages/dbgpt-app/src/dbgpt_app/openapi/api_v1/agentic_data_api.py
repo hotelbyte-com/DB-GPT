@@ -1221,7 +1221,36 @@ def _typed_tool_gap(kind: str, reason: str, evidence: Any = None) -> str:
     )
 
 
+def _declares_governed_query_contract(dialogue: ConversationVo) -> bool:
+    return bool(
+        _is_hotel_be_data_agent_source(dialogue.ext_info)
+        and isinstance(dialogue.ext_info, dict)
+        and "query_contract" in dialogue.ext_info
+    )
+
+
 async def _react_agent_stream(
+    dialogue: ConversationVo,
+) -> AsyncGenerator[str, None]:
+    """Route declared typed contracts away from the probabilistic ReAct loop."""
+
+    if _declares_governed_query_contract(dialogue):
+        from dbgpt_app.scene.chat_db.governed_query_stream import (
+            stream_governed_query_contract,
+        )
+
+        async for event in stream_governed_query_contract(
+            dialogue,
+            system_app=CFG.SYSTEM_APP,
+            contract_resolver=_react_agent_contract_resolution,
+        ):
+            yield event
+        return
+    async for event in _general_react_agent_stream(dialogue):
+        yield event
+
+
+async def _general_react_agent_stream(
     dialogue: ConversationVo,
 ) -> AsyncGenerator[str, None]:
     import asyncio

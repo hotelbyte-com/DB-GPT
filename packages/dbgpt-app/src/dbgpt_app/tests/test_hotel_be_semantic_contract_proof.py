@@ -5,10 +5,22 @@
 
 import json
 
+import pytest
+
+from dbgpt_app.openapi.api_v1 import agentic_data_api
+from dbgpt_app.openapi.api_view_model import ConversationVo
+from dbgpt_app.scene.chat_db.datasource_router import DatasourceResolution
 from dbgpt_app.scene.chat_db.query_contract import (
     DataQueryContract,
     validate_result_semantics,
     validate_sql_semantics,
+)
+from dbgpt_app.scene.chat_db.query_contract_compiler import (
+    DETERMINISTIC_CONTRACT_STRATEGY,
+    compile_data_query_contract,
+)
+from dbgpt_app.scene.chat_db.query_contract_execution import (
+    execute_compiled_data_query,
 )
 
 
@@ -16,6 +28,7 @@ def _issue_21706_contract() -> DataQueryContract:
     return DataQueryContract.model_validate(
         {
             "version": "hotelbyte.data-query/v1",
+            "contract_id": "supplier_hotelrates_failure_rate_24h",
             "logical_group": "hotel-be",
             "required_capabilities": [
                 "operational_logs",
@@ -254,6 +267,7 @@ def test_issue_21706_ast_contract_rejects_narrowed_failure_predicate():
 def test_query_contract_serializes_without_a_physical_datasource_name():
     payload = json.loads(_issue_21706_contract().model_dump_json())
 
+    assert payload["contract_id"] == "supplier_hotelrates_failure_rate_24h"
     assert payload["logical_group"] == "hotel-be"
     assert payload["required_capabilities"] == [
         "operational_logs",
@@ -262,6 +276,219 @@ def test_query_contract_serializes_without_a_physical_datasource_name():
     ]
     assert "database_name" not in payload
     assert "datasource_name" not in payload
+
+
+def test_issue_21706_contract_compiles_from_typed_semantics():
+    compilation = compile_data_query_contract(_issue_21706_contract())
+
+    assert compilation.status == "compiled"
+    assert compilation.query is not None
+    assert compilation.query.strategy == DETERMINISTIC_CONTRACT_STRATEGY
+    assert compilation.query.sql_semantics.valid
+    assert "FROM hb_log" in compilation.query.sql
+    assert "hblog_ns" not in compilation.query.sql
+    assert "biz_error_code != '' OR output_http_status_code >= 400" in (
+        compilation.query.sql
+    )
+    assert "NOW - 24 h" in compilation.query.sql
+    assert "/ COUNT(*) AS error_rate_pct" in compilation.query.sql
+    assert compilation.query.sql_semantics.dialect_normalizations == [
+        "tdengine_duration"
+    ]
+    assert "ORDER BY error_rate_pct DESC, total_requests DESC" in (
+        compilation.query.sql
+    )
+
+
+def test_unknown_contract_returns_typed_compiler_gap():
+    contract = _issue_21706_contract().model_copy(
+        update={"contract_id": "unknown_business_contract"}
+    )
+
+    compilation = compile_data_query_contract(contract)
+
+    assert compilation.status == "unsupported"
+    assert compilation.gap_kind == "contract_compiler_unsupported"
+    assert compilation.query is None
+
+
+def test_registered_contract_with_weakened_shape_fails_closed():
+    contract = _issue_21706_contract()
+    contract.semantic.strict_predicates = False
+
+    compilation = compile_data_query_contract(contract)
+
+    assert compilation.status == "invalid"
+    assert compilation.gap_kind == "contract_compile_invalid"
+    assert "strict_predicates_required" in compilation.evidence["errors"]
+
+
+def test_compiled_contract_executes_and_proves_results_without_an_llm():
+    class Connector:
+        def __init__(self):
+            self.sql = ""
+
+        def run(self, sql):
+            self.sql = sql
+            return [
+                [
+                    ("supplier",),
+                    ("failed_requests",),
+                    ("total_requests",),
+                    ("error_rate_pct",),
+                ],
+                ["A", 3, 10, 30.0],
+                ["B", 1, 10, 10.0],
+            ]
+
+    contract = _issue_21706_contract()
+    compilation = compile_data_query_contract(contract)
+    connector = Connector()
+    outcome = execute_compiled_data_query(
+        compilation,
+        contract,
+        connector,
+        physical_source_name="hblog-shared",
+        physical_source_type="tdengine",
+        source_resolution={
+            "logical_group": "hotel-be",
+            "status": "selected",
+            "selected": "hblog-shared",
+            "selected_type": "tdengine",
+        },
+        schema={"status": "loaded", "tables": ["hb_log"], "error_type": ""},
+    )
+
+    assert outcome.status == "executed"
+    assert outcome.artifact is not None
+    assert outcome.artifact["row_count"] == 2
+    assert outcome.artifact["provenance"]["query_plan"] == {
+        "strategy": "deterministic_contract",
+        "compiler": "hotelbyte.raw_failure_rate/v1",
+        "dialect": "tdengine",
+        "contract_id": "supplier_hotelrates_failure_rate_24h",
+        "contract_version": "hotelbyte.data-query/v1",
+    }
+    assert outcome.artifact["provenance"]["result_semantics"]["valid"]
+    assert connector.sql == compilation.query.sql
+
+
+def test_compiled_contract_rejects_a_non_tdengine_physical_source():
+    class Connector:
+        def run(self, sql):
+            raise AssertionError("dialect mismatch must fail before SQL execution")
+
+    contract = _issue_21706_contract()
+    outcome = execute_compiled_data_query(
+        compile_data_query_contract(contract),
+        contract,
+        Connector(),
+        physical_source_name="hotel",
+        physical_source_type="mysql",
+        source_resolution={
+            "logical_group": "hotel-be",
+            "status": "selected",
+            "selected": "hotel",
+            "selected_type": "mysql",
+        },
+        schema={"status": "loaded", "tables": ["hb_log"], "error_type": ""},
+    )
+
+    assert outcome.status == "gap"
+    assert outcome.gap["kind"] == "source_dialect_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_governed_stream_runs_the_compiled_query_without_an_llm(
+    monkeypatch,
+):
+    contract = _issue_21706_contract()
+    resolution = DatasourceResolution(
+        logical_group="hotel-be",
+        status="selected",
+        selected="hblog-shared",
+        selected_type="tdengine",
+        required_capabilities=contract.required_capabilities,
+    )
+
+    class Connector:
+        def get_table_names(self):
+            return ["hb_log"]
+
+        def get_table_info_no_throw(self):
+            return "hb_log(...)"
+
+        def run(self, sql):
+            assert "NOW - 24 h" in sql
+            return [
+                [
+                    ("supplier",),
+                    ("failed_requests",),
+                    ("total_requests",),
+                    ("error_rate_pct",),
+                ],
+                ["A", 3, 10, 30.0],
+            ]
+
+    class Manager:
+        def get_connector(self, name):
+            assert name == "hblog-shared"
+            return Connector()
+
+    class ConversationService:
+        conv_storage = None
+        message_storage = None
+
+    class Storage:
+        def __init__(self, **kwargs):
+            pass
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(
+        agentic_data_api,
+        "_react_agent_contract_resolution",
+        lambda dialogue, user_input: (contract, resolution),
+    )
+    monkeypatch.setattr(
+        agentic_data_api.ConnectorManager,
+        "get_instance",
+        lambda system_app: Manager(),
+    )
+    monkeypatch.setattr("dbgpt.core.StorageConversation", Storage)
+    monkeypatch.setattr(
+        "dbgpt_serve.conversation.serve.Serve.get_instance",
+        lambda system_app: ConversationService(),
+    )
+    dialogue = ConversationVo(
+        conv_uid="compiled-contract-proof",
+        select_param="hotel-be",
+        ext_info={
+            "source": "hotel-be-data-agent",
+            "query_contract": contract.model_dump(),
+        },
+        user_input="supplier reliability",
+    )
+
+    events = [
+        json.loads(event.removeprefix("data: "))
+        async for event in agentic_data_api._react_agent_stream(dialogue)
+    ]
+
+    assert [event["type"] for event in events] == [
+        "step.start",
+        "step.meta",
+        "step.chunk",
+        "step.chunk",
+        "step.done",
+        "final",
+        "done",
+    ]
+    artifact_chunk = events[3]["content"]
+    assert "```response_table" in artifact_chunk
+    assert '"strategy": "deterministic_contract"' in artifact_chunk
+    assert '"dialect": "tdengine"' in artifact_chunk
 
 
 def test_issue_21706_result_equivalence_accepts_formula_and_sort_order():

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 
 from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError
+from sqlglot.tokens import Tokenizer
 
 from dbgpt._private.pydantic import BaseModel, Field
 
@@ -79,6 +80,7 @@ class SQLSemanticContract(BaseModel):
 
 class DataQueryContract(BaseModel):
     version: Literal[DATA_QUERY_CONTRACT_VERSION]
+    contract_id: str = ""
     logical_group: str
     required_capabilities: List[str] = Field(default_factory=list)
     semantic: SQLSemanticContract = Field(default_factory=SQLSemanticContract)
@@ -97,6 +99,7 @@ class SQLSemanticEvidence(BaseModel):
     failure_predicate_verified: bool = False
     rolling_window_hours: Optional[int] = None
     zero_denominator_policy: str = ""
+    dialect_normalizations: List[str] = Field(default_factory=list)
     fingerprint: str = ""
 
 
@@ -139,8 +142,12 @@ def validate_sql_semantics(
     """
 
     evidence = SQLSemanticEvidence()
+    normalized_input, dialect_normalizations = _normalize_tdengine_durations(
+        str(sql or "").strip()
+    )
+    evidence.dialect_normalizations = dialect_normalizations
     try:
-        statement = parse_one(str(sql or "").strip())
+        statement = parse_one(normalized_input)
     except (ParseError, ValueError) as exc:
         evidence.errors.append(f"sql_parse_failed:{type(exc).__name__}")
         return evidence
@@ -246,7 +253,9 @@ def validate_sql_semantics(
         rate_alias = _normalized_name(failure_requirement.rate_alias)
         rate_projection = projection_by_alias.get(rate_alias)
         if rate_projection is None or not _matches_raw_failure_rate(
-            rate_projection, failure_requirement
+            rate_projection,
+            failure_requirement,
+            grouped_nonzero=bool(semantic.required_group_by),
         ):
             evidence.errors.append(f"raw_failure_rate_invalid:{rate_alias}")
         else:
@@ -463,7 +472,10 @@ def _matches_raw_failed_count(
 
 
 def _matches_raw_failure_rate(
-    projection: exp.Expression, requirement: RawFailureRateRequirement
+    projection: exp.Expression,
+    requirement: RawFailureRateRequirement,
+    *,
+    grouped_nonzero: bool = False,
 ) -> bool:
     expression = projection.this if isinstance(projection, exp.Alias) else projection
     # A zero-fallback COALESCE fabricates 0% for an unevaluable sample.
@@ -485,7 +497,9 @@ def _matches_raw_failure_rate(
             scale = scale * numeric if direction > 0 else scale / numeric
         elif direction > 0 and _is_failure_sum(factor, requirement):
             failure_terms += 1
-        elif direction < 0 and _is_safe_count_denominator(factor):
+        elif direction < 0 and _is_safe_count_denominator(
+            factor, grouped_nonzero=grouped_nonzero
+        ):
             denominator_terms += 1
         else:
             return False
@@ -514,13 +528,63 @@ def _collect_ratio_factors(
     return True
 
 
-def _is_safe_count_denominator(expression: exp.Expression) -> bool:
+def _is_safe_count_denominator(
+    expression: exp.Expression, *, grouped_nonzero: bool
+) -> bool:
     expression = _unwrap(expression)
-    return (
+    return (grouped_nonzero and _is_count_all(expression)) or (
         isinstance(expression, exp.Nullif)
         and _is_count_all(expression.this)
         and _literal_number(expression.expression) == 0
     )
+
+
+def _normalize_tdengine_durations(sql: str) -> tuple[str, List[str]]:
+    """Normalize TDengine ``NOW - 24 h`` only for SQLGlot AST parsing.
+
+    Token positions keep quoted strings untouched. The executed SQL remains the
+    original TDengine dialect and provenance records that normalization occurred.
+    """
+
+    try:
+        tokens = Tokenizer().tokenize(sql)
+    except Exception:
+        return sql, []
+    replacements: List[tuple[int, int, str]] = []
+    units = {
+        "s": "SECOND",
+        "m": "MINUTE",
+        "h": "HOUR",
+        "d": "DAY",
+        "w": "WEEK",
+    }
+    for index in range(len(tokens) - 3):
+        now, dash, amount, unit = tokens[index : index + 4]
+        normalized_unit = units.get(unit.text.lower())
+        if (
+            now.text.upper() == "NOW"
+            and dash.text == "-"
+            and amount.text.isdigit()
+            and normalized_unit is not None
+        ):
+            replacements.append(
+                (
+                    now.start,
+                    unit.end + 1,
+                    f"NOW() - INTERVAL {amount.text} {normalized_unit}",
+                )
+            )
+    if not replacements:
+        return sql, []
+    pieces: List[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        if start < cursor:
+            continue
+        pieces.extend([sql[cursor:start], replacement])
+        cursor = end
+    pieces.append(sql[cursor:])
+    return "".join(pieces), ["tdengine_duration"]
 
 
 def _is_failure_sum(
