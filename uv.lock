@@ -5887,6 +5887,7 @@ dependencies = [
     { name = "dbgpt-serve" },
     { name = "httpx" },
     { name = "pyparsing" },
+    { name = "sqlglot" },
 ]
 
 [package.optional-dependencies]
@@ -5924,6 +5925,7 @@ requires-dist = [
     { name = "poetry", marker = "extra == 'dbgpts'" },
     { name = "pyparsing" },
     { name = "rocksdict", marker = "extra == 'cache'" },
+    { name = "sqlglot", specifier = "==26.13.2" },
 ]
 provides-extras = ["cache", "observability", "base", "dbgpts"]
 

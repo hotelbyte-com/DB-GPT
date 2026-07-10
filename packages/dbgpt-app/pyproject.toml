@@ -19,6 +19,7 @@ dependencies = [
     "aiofiles",
     "httpx>=0.24.0",
     "pyparsing",
+    "sqlglot==26.13.2",
 ]
 
 [project.urls]
@@ -83,4 +84,3 @@ exclude = [
 "../../pilot/examples/Walmart_Sales.db" = "pilot_tpl/examples/Walmart_Sales.db"
 
 [tool.hatch.build.hooks.custom]
-
