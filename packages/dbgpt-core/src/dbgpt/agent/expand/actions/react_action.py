@@ -408,12 +408,11 @@ class ReActAction(ToolAction):
             )
 
         if not name:
-            terminal_content = str(action_input_str if action_input_str else ai_message)
             return ActionOutput(
-                is_exe_success=True,
-                content=terminal_content,
-                observations=terminal_content,
-                terminate=True,
+                is_exe_success=False,
+                content="A ReAct step must declare an action before it can execute.",
+                have_retry=True,
+                terminate=False,
             )
 
         try:
