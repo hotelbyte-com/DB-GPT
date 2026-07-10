@@ -1,6 +1,7 @@
 import json
 import logging
-from typing import List, Optional, Union
+import re
+from typing import Any, List, Mapping, Optional, Union
 
 from fastapi import HTTPException
 
@@ -30,6 +31,73 @@ from ..config import SERVE_SERVICE_COMPONENT_NAME, ServeConfig
 
 logger = logging.getLogger(__name__)
 CFG = Config()
+
+REDACTED_DATASOURCE_VALUE = "***"
+_DATASOURCE_SECRET_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "dbpwd",
+        "secret",
+        "clientsecret",
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "authtoken",
+        "privatekey",
+        "credential",
+        "credentials",
+        "dsn",
+        "uri",
+        "url",
+        "connectionstring",
+    }
+)
+
+
+def _is_datasource_secret_key(key: Any) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    if compact in _DATASOURCE_SECRET_KEYS:
+        return True
+    return compact.endswith(("password", "passwd", "secret", "token", "privatekey"))
+
+
+def redact_datasource_params(value: Any) -> Any:
+    """Return datasource response metadata without credential values.
+
+    Persisted connection state remains intact for DB-GPT connector creation.
+    This function is only applied at the API response boundary and recursively
+    handles connector-specific nested or JSON-encoded extension parameters.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                REDACTED_DATASOURCE_VALUE
+                if _is_datasource_secret_key(key)
+                else redact_datasource_params(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_datasource_params(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_datasource_params(item) for item in value)
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        return json.dumps(
+            redact_datasource_params(decoded),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return value
 
 
 class Service(
@@ -175,11 +243,6 @@ class Service(
         Returns:
             DatasourceQueryResponse: The response
         """
-        str_db_type = (
-            request.type
-            if isinstance(request, DatasourceCreateRequest)
-            else request.db_type
-        )
         desc = ""
         if isinstance(request, DatasourceCreateRequest):
             connector_params: BaseDatasourceParameters = (
@@ -266,7 +329,7 @@ class Service(
     ) -> DatasourceQueryResponse:
         param_cls = self.datasource_manager._get_param_cls(res.db_type)
         param = param_cls.from_persisted_state(model_to_dict(res))
-        param_dict = param.to_dict()
+        param_dict = redact_datasource_params(param.to_dict())
         return DatasourceQueryResponse(
             type=res.db_type,
             params=param_dict,

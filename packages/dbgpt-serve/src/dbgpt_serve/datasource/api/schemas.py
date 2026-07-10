@@ -93,7 +93,10 @@ class DatasourceCreateRequest(BaseModel):
 
 
 class DatasourceQueryResponse(DatasourceCreateRequest):
-    """Response model for datasource query"""
+    """Response model for datasource query.
+
+    Credential-bearing parameter values are redacted at the service boundary.
+    """
 
     db_name: Optional[str] = Field(
         None, description="Internal database name used for connector lookup."

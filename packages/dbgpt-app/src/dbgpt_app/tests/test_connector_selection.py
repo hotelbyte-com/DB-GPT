@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 from dbgpt_app.openapi.api_v1.agentic_data_api import (
     _extract_hotel_be_user_question,
+    _extract_terminate_output,
     _is_hotel_be_data_agent_source,
     _normalize_sql_display_type,
     _parse_connector_ids,
@@ -114,9 +115,7 @@ class TestHotelBeSQLGovernance:
         )
 
     def test_rejects_non_select(self):
-        assert "SELECT" in _validate_hotel_be_sql_query(
-            "SHOW TABLES LIMIT 10"
-        )
+        assert "SELECT" in _validate_hotel_be_sql_query("SHOW TABLES LIMIT 10")
 
     def test_rejects_multi_statement_select(self):
         assert "单条" in _validate_hotel_be_sql_query(
@@ -126,10 +125,7 @@ class TestHotelBeSQLGovernance:
 
 class TestHotelBeWrappedQuestion:
     def test_extracts_question_after_hotel_be_marker(self):
-        wrapped = (
-            "system contract\n\n---\n用户问题:\n"
-            "使用 hotel_names 表统计每日更新。"
-        )
+        wrapped = "system contract\n\n---\n用户问题:\n使用 hotel_names 表统计每日更新。"
         assert (
             _extract_hotel_be_user_question(wrapped)
             == "使用 hotel_names 表统计每日更新。"
@@ -138,6 +134,18 @@ class TestHotelBeWrappedQuestion:
     def test_plain_question_passthrough(self):
         question = "使用 hotel_catalog 表按 status 汇总。"
         assert _extract_hotel_be_user_question(question) == question
+
+
+class TestTerminateOutput:
+    def test_extracts_canonical_output(self):
+        parser = MagicMock()
+        parser.parse.return_value = [MagicMock(action_input='{"output":"done"}')]
+        assert _extract_terminate_output("raw", parser) == "done"
+
+    def test_supports_legacy_result_during_transition(self):
+        parser = MagicMock()
+        parser.parse.return_value = [MagicMock(action_input='{"result":"legacy"}')]
+        assert _extract_terminate_output("raw", parser) == "legacy"
 
 
 # ---------------------------------------------------------------------------
