@@ -345,7 +345,12 @@ def _inline_system_messages(
     if not system_text:
         return messages
     if not messages:
-        return [{"role": "user", "content": system_text}]
+        return [
+            {
+                "role": "user",
+                "content": _format_inlined_system(system_text, ""),
+            }
+        ]
 
     inlined = [dict(message) for message in messages]
     first_message = inlined[0]
