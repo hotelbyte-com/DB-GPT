@@ -290,7 +290,8 @@ def test_issue_21706_contract_compiles_from_typed_semantics():
     assert "biz_error_code != '' OR output_http_status_code >= 400" in (
         compilation.query.sql
     )
-    assert "NOW - 24 h" in compilation.query.sql
+    assert "NOW - 24h" in compilation.query.sql
+    assert "NOW - 24 h" not in compilation.query.sql
     assert "/ COUNT(*) AS error_rate_pct" in compilation.query.sql
     assert compilation.query.sql_semantics.dialect_normalizations == [
         "tdengine_duration"
@@ -419,7 +420,7 @@ async def test_governed_stream_runs_the_compiled_query_without_an_llm(
             return "hb_log(...)"
 
         def run(self, sql):
-            assert "NOW - 24 h" in sql
+            assert "NOW - 24h" in sql
             return [
                 [
                     ("supplier",),

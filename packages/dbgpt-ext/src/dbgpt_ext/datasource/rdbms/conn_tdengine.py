@@ -6,7 +6,7 @@ Uses the official taos-ws-py (WebSocket) driver via sqlalchemy-tdengine dialect.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Dict, Iterable, List, Optional, Tuple, Type
 
 from sqlalchemy import text
 
@@ -51,7 +51,9 @@ class TDengineParameters(BaseDatasourceParameters):
     )
     database: str = field(
         default="",
-        metadata={"help": _("Database name, leave empty to connect without default db")},
+        metadata={
+            "help": _("Database name, leave empty to connect without default db")
+        },
     )
     password: str = field(
         default="${env:DBGPT_DB_PASSWORD}",
@@ -132,13 +134,15 @@ class TDengineConnector(RDBMSConnector):
     def get_table_names(self) -> List[str]:
         try:
             with self.session_scope() as session:
-                cursor = session.execute(text("SHOW TABLES"))
-                rows = cursor.fetchall()
-                return [
-                    row[0]
-                    for row in rows
-                    if row[0] not in self.default_db
-                ]
+                names = []
+                for statement in ("SHOW TABLES", "SHOW STABLES"):
+                    cursor = session.execute(text(statement))
+                    names.extend(
+                        row[0]
+                        for row in cursor.fetchall()
+                        if row[0] not in self.default_db
+                    )
+                return list(dict.fromkeys(names))
         except Exception:
             return []
 

@@ -174,7 +174,7 @@ def _compile_raw_failure_rate(
         f"'{_escape_literal(item.value)}'"
         for item in semantic.required_filters
     ]
-    filters.append(f"{rolling.column} >= NOW - {rolling.hours} h")
+    filters.append(f"{rolling.column} >= NOW - {rolling.hours}h")
     order_by = ", ".join(
         f"{item.expression} {item.direction.upper()}"
         for item in semantic.required_order_by
