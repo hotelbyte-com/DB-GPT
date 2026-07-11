@@ -250,10 +250,7 @@ class ClaudeLLMClient(ProxyLLMClient):
             usage = None
             finish_reason = response.stop_reason
             if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.input_tokens,
-                    "completion_tokens": response.usage.output_tokens,
-                }
+                usage = _anthropic_usage(response.usage)
             response_content = response.content
             if not response_content:
                 raise ValueError("Response content is empty")
@@ -297,12 +294,13 @@ class ClaudeLLMClient(ProxyLLMClient):
             ) as stream:
                 async for text in stream.text_stream:
                     full_text += text
-                    raw_usage = stream.current_message_snapshot.usage
-                    usage = {
-                        "prompt_tokens": raw_usage.input_tokens,
-                        "completion_tokens": raw_usage.output_tokens,
-                    }
-                    yield ModelOutput(text=full_text, error_code=0, usage=usage)
+                    yield ModelOutput(text=full_text, error_code=0)
+                final_message = await stream.get_final_message()
+                yield ModelOutput(
+                    text=full_text,
+                    error_code=0,
+                    usage=_anthropic_usage(final_message.usage),
+                )
         except Exception as e:
             yield ModelOutput(
                 text=f"**Claude Generate Stream Error, Please CheckErrorInfo.**: {e}",
@@ -326,6 +324,16 @@ class ClaudeLLMClient(ProxyLLMClient):
             eg. get real context length from the openai api.
         """
         return self.context_length
+
+
+def _anthropic_usage(raw_usage: Any) -> Dict[str, int]:
+    prompt_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
+    completion_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 
 def _inline_system_messages(
