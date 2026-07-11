@@ -106,7 +106,6 @@ def _load_connector(
         manager = ConnectorManager.get_instance(system_app)
         connector = manager.get_connector(source_name)
         tables = sorted(str(name) for name in connector.get_table_names())
-        connector.get_table_info_no_throw()
         schema = {"status": "loaded", "tables": tables, "error_type": ""}
     except Exception as exc:
         logger.warning(

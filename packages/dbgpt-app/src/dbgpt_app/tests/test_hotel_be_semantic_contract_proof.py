@@ -417,7 +417,7 @@ async def test_governed_stream_runs_the_compiled_query_without_an_llm(
             return ["hb_log"]
 
         def get_table_info_no_throw(self):
-            return "hb_log(...)"
+            raise AssertionError("governed execution must not sample every table")
 
         def run(self, sql):
             assert "NOW - 24h" in sql
