@@ -6,6 +6,7 @@ import uuid
 from typing import Any, AsyncGenerator, Callable
 
 from dbgpt.core import StorageConversation
+from dbgpt_app.openapi.api_v1.react_agent_sse import emit_react_agent_event
 from dbgpt_app.openapi.api_view_model import ConversationVo
 from dbgpt_app.scene.chat_db.query_contract import DataQueryContract
 from dbgpt_app.scene.chat_db.query_contract_compiler import (
@@ -61,7 +62,7 @@ async def stream_governed_query_contract(
         yield event
     _persist_history(dialogue, user_input, contract, outcome, system_app)
     yield _sse_event({"type": "final", "content": outcome.final_content})
-    yield _sse_event({"type": "done"})
+    yield _sse_event({"type": "done", "status": "done"})
 
 
 def _resolve_and_compile(
@@ -235,4 +236,4 @@ def _contract_action_input(contract: DataQueryContract) -> str:
 
 
 def _sse_event(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return emit_react_agent_event(payload)

@@ -23,6 +23,12 @@ from dbgpt.component import ComponentType
 from dbgpt.configs.model_config import SKILLS_DIR, resolve_root_path
 from dbgpt.core import PromptTemplate
 from dbgpt.model.cluster import WorkerManagerFactory
+from dbgpt_app.openapi.api_v1.react_agent_sse import (
+    REACT_AGENT_ERROR_MESSAGES,
+    classify_react_agent_error,
+    emit_react_agent_event,
+    terminal_error_events,
+)
 from dbgpt_app.openapi.api_view_model import (
     ConversationVo,
     Result,
@@ -1088,7 +1094,7 @@ async def skill_import_from_github_v2(
 
 
 def _sse_event(payload: Dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return emit_react_agent_event(payload)
 
 
 def _optional_str(value: Any) -> Optional[str]:
@@ -1337,7 +1343,14 @@ async def _general_react_agent_stream(
         return step_id, _sse_event(event_data)
 
     def step_output(detail: str):
-        return _sse_event({"type": "step.output", "step": step, "detail": detail})
+        return _sse_event(
+            {
+                "type": "step.output",
+                "step": step,
+                "id": f"step-{step}",
+                "detail": detail,
+            }
+        )
 
     def step_chunk(step_id: str, output_type: str, content: Any):
         return _sse_event(
@@ -4681,7 +4694,8 @@ Action Input: The JSON format of tool parameters
     try:
         reply = await agent_task
     except Exception as e:
-        err_msg = f"React agent failed: {e}"
+        error_code = classify_react_agent_error(e)
+        err_msg = REACT_AGENT_ERROR_MESSAGES[error_code]
         error_payload = json.dumps(
             {
                 "version": 1,
@@ -4696,8 +4710,8 @@ Action Input: The JSON format of tool parameters
         storage_conv.add_view_message(error_payload)
         storage_conv.end_current_round()
         storage_conv.save_to_storage()
-        yield _sse_event({"type": "final", "content": err_msg})
-        yield _sse_event({"type": "done"})
+        for terminal_event in terminal_error_events(e):
+            yield terminal_event
         return
 
     if reply.action_report and reply.action_report.terminate:
@@ -4749,7 +4763,7 @@ Action Input: The JSON format of tool parameters
     storage_conv.save_to_storage()
 
     yield _sse_event({"type": "final", "content": final_content})
-    yield _sse_event({"type": "done"})
+    yield _sse_event({"type": "done", "status": "done"})
 
 
 # ---------------------------------------------------------------------------
