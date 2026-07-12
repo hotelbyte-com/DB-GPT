@@ -214,7 +214,7 @@ class ClaudeLLMClient(ProxyLLMClient):
         # Apply claude kwargs
         for k, v in self._claude_kwargs.items():
             payload[k] = v
-        if request.temperature:
+        if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_new_tokens:
             payload["max_tokens"] = request.max_new_tokens

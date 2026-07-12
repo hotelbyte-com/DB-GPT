@@ -63,6 +63,20 @@ def test_inline_system_messages_preserves_prompt_when_only_system_exists():
     ]
 
 
+def test_build_request_preserves_explicit_zero_temperature():
+    client = ClaudeLLMClient(model="test-model", model_alias="test-model")
+    request = ModelRequest(
+        model="test-model",
+        messages=[ModelMessage(role="user", content="hi")],
+        temperature=0.0,
+    )
+
+    payload = client._build_request(request)
+
+    assert "temperature" in payload
+    assert payload["temperature"] == 0.0
+
+
 @pytest.mark.asyncio
 async def test_stream_emits_final_anthropic_usage():
     stream = _FakeMessageStream()
