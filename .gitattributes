@@ -1,0 +1,2 @@
+.env export-ignore
+web/.env.template export-ignore
