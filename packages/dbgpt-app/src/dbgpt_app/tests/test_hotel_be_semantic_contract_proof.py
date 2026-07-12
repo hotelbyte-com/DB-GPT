@@ -486,6 +486,9 @@ async def test_governed_stream_runs_the_compiled_query_without_an_llm(
         "final",
         "done",
     ]
+    assert all(event["contractVersion"] == "react-agent-sse.v1" for event in events)
+    assert events[-2]["status"] == "success"
+    assert events[-1]["status"] == "done"
     artifact_chunk = events[3]["content"]
     assert "```response_table" in artifact_chunk
     assert '"strategy": "deterministic_contract"' in artifact_chunk

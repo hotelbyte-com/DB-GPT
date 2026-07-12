@@ -55,10 +55,19 @@ export interface SSEStepDoneEvent {
 export interface SSEFinalEvent {
   type: 'final';
   content: string;
+  status?: 'success';
 }
 
 export interface SSEDoneEvent {
   type: 'done';
+  status?: 'done' | 'failed';
+}
+
+export interface SSEErrorEvent {
+  type: 'error';
+  code: string;
+  message: string;
+  status: 'failed';
 }
 
 export interface SSEContextStatusEvent {
@@ -80,6 +89,7 @@ export type SSEEvent =
   | SSEStepDoneEvent
   | SSEContextStatusEvent
   | SSEFinalEvent
+  | SSEErrorEvent
   | SSEDoneEvent;
 
 // Internal state for tracking context budget
@@ -146,8 +156,11 @@ export class ReActSSEState {
       case 'final':
         this.handleFinal(event);
         break;
+      case 'error':
+        this.handleError(event);
+        break;
       case 'done':
-        this.handleDone();
+        this.handleDone(event);
         break;
     }
   }
@@ -211,7 +224,11 @@ export class ReActSSEState {
     this.finalContent = event.content;
   }
 
-  private handleDone(): void {
+  private handleError(event: SSEErrorEvent): void {
+    this.finalContent = event.message;
+  }
+
+  private handleDone(_event: SSEDoneEvent): void {
     this.isDone = true;
     this.endTime = Date.now();
   }
