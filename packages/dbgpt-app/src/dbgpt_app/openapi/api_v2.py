@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from dbgpt._private.pydantic import model_to_dict, model_to_json
 from dbgpt.component import SystemApp, logger
+from dbgpt.core import ModelOutput
 from dbgpt.core.schema.api import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -259,13 +260,29 @@ async def no_stream_wrapper(
         chat (BaseChat): chat
     """
     with root_tracer.start_span("no_stream_generator"):
-        response = await chat.nostream_call()
+        final_output: Optional[ModelOutput] = None
+        async for output in chat.stream_call(text_output=False, incremental=False):
+            if isinstance(output, ModelOutput):
+                final_output = output
+        if final_output is None:
+            raise RuntimeError("model response did not include a final output")
+        response = final_output.text if final_output.has_text else ""
         msg = response.replace("\ufffd", "").replace("&quot;", '"')
         choice_data = ChatCompletionResponseChoice(
             index=0,
             message=ChatMessage(role="assistant", content=msg),
         )
-        usage = UsageInfo()
+        raw_usage = final_output.usage or {}
+        prompt_tokens = int(raw_usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(raw_usage.get("completion_tokens", 0) or 0)
+        total_tokens = raw_usage.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=int(total_tokens or 0),
+        )
         return ChatCompletionResponse(
             id=request.conv_uid, choices=[choice_data], model=request.model, usage=usage
         )
