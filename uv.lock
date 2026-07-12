@@ -5879,7 +5879,7 @@ version = "0.8.1"
 source = { editable = "packages/dbgpt-app" }
 dependencies = [
     { name = "aiofiles" },
-    { name = "dbgpt", extra = ["agent", "cli", "client", "code", "framework", "proxy-openai", "proxy-tongyi", "proxy-zhipuai", "simple-framework"] },
+    { name = "dbgpt", extra = ["agent", "cli", "client", "code", "framework", "proxy-anthropic", "proxy-openai", "proxy-tongyi", "proxy-zhipuai", "simple-framework"] },
     { name = "dbgpt-acc-auto" },
     { name = "dbgpt-client" },
     { name = "dbgpt-ext", extra = ["rag", "storage-chromadb"] },
@@ -5912,7 +5912,7 @@ requires-dist = [
     { name = "aiofiles" },
     { name = "build", marker = "extra == 'dbgpts'" },
     { name = "dbgpt", extras = ["client", "cli", "agent", "simple-framework", "framework", "code"], marker = "extra == 'base'", editable = "packages/dbgpt-core" },
-    { name = "dbgpt", extras = ["client", "cli", "agent", "simple-framework", "framework", "code", "proxy-openai", "proxy-tongyi", "proxy-zhipuai"], editable = "packages/dbgpt-core" },
+    { name = "dbgpt", extras = ["client", "cli", "agent", "simple-framework", "framework", "code", "proxy-openai", "proxy-anthropic", "proxy-tongyi", "proxy-zhipuai"], editable = "packages/dbgpt-core" },
     { name = "dbgpt-acc-auto", editable = "packages/dbgpt-accelerator/dbgpt-acc-auto" },
     { name = "dbgpt-client", editable = "packages/dbgpt-client" },
     { name = "dbgpt-ext", extras = ["rag", "storage-chromadb"], editable = "packages/dbgpt-ext" },

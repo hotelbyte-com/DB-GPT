@@ -19,40 +19,30 @@ persist_path = "pilot/data"
 # Model Configurations
 [models]
 
-# ── Default: MiniMax-M2.7 (international) ──
+# Hotel-BE's agent/config/config.yaml is the provider/model authority for this
+# manufacturing runtime. Credentials remain runtime inputs; this file does not
+# create, rotate, or rename them.
+
+# ── Default: MiniMax-M3 (Anthropic-compatible endpoint) ──
 [[models.llms]]
-name = "${env:LLM_MODEL_NAME:-MiniMax-M2.7}"
-provider = "proxy/openai"
-api_base = "https://api.minimax.io/v1"
+name = "MiniMax-M3"
+provider = "proxy/claude"
+api_base = "https://api.minimax.io/anthropic"
 api_key = "${env:MINIMAX_API_KEY}"
 
-# ── kimi-for-coding (本地代理) ──
+# ── Kimi retry model (Anthropic-compatible endpoint) ──
 [[models.llms]]
-name = "kimi-for-coding"
-provider = "proxy/openai"
-api_base = "http://kimi.hotelbyte.com:3000/v1"
+name = "kimi2.7"
+provider = "proxy/claude"
+api_base = "https://api.kimi.com/coding/"
 api_key = "${env:KIMI_API_KEY}"
 
-# ── glm-4.7 (z.ai coding plan) ──
+# ── GLM judge/fallback model (Anthropic-compatible endpoint) ──
 [[models.llms]]
-name = "glm-4.7"
-provider = "proxy/openai"
-api_base = "https://api.z.ai/api/coding/paas/v4/"
+name = "glm-5.2"
+provider = "proxy/claude"
+api_base = "https://api.z.ai/api/anthropic"
 api_key = "${env:ZAI_API_KEY}"
-
-# ── deepseek-v4-flash (fast, cheap) ──
-[[models.llms]]
-name = "deepseek-v4-flash"
-provider = "proxy/deepseek"
-api_base = "https://api.deepseek.com/v1"
-api_key = "${env:DEEPSEEK_API_KEY}"
-
-# ── deepseek-v4-pro (stronger reasoning) ──
-[[models.llms]]
-name = "deepseek-v4-pro"
-provider = "proxy/deepseek"
-api_base = "https://api.deepseek.com/v1"
-api_key = "${env:DEEPSEEK_API_KEY}"
 
 # Embedding: Ollama local (nomic-embed-text, 768-dim)
 [[models.embeddings]]
