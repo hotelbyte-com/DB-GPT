@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
 REACT_AGENT_SSE_V1 = "react-agent-sse.v1"
 
@@ -14,6 +14,18 @@ class ReActSSEEventSpec:
     required: frozenset[str]
     fixed_status: str | None = None
     allowed_statuses: frozenset[str] = frozenset()
+
+
+def close_terminate_step(
+    round_step_map: MutableMapping[int, str],
+    round_num: int,
+) -> str | None:
+    step_id = round_step_map.pop(round_num, None)
+    if not step_id:
+        return None
+    return emit_react_agent_event(
+        {"type": "step.done", "id": step_id, "status": "done"}
+    )
 
 
 REACT_AGENT_SSE_V1_REGISTRY: Mapping[str, ReActSSEEventSpec] = {
