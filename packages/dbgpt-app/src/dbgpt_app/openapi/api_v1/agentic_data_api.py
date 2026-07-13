@@ -33,6 +33,10 @@ from dbgpt_app.openapi.api_view_model import (
     ConversationVo,
     Result,
 )
+from dbgpt_app.scene.chat_db.manufacturing_mongo_stream import (
+    is_manufacturing_mongo_source,
+    stream_manufacturing_mongo_query,
+)
 from dbgpt_serve.datasource.manages import ConnectorManager
 from dbgpt_serve.utils.auth import UserRequest, get_user_from_headers
 
@@ -1240,6 +1244,10 @@ async def _react_agent_stream(
 ) -> AsyncGenerator[str, None]:
     """Route declared typed contracts away from the probabilistic ReAct loop."""
 
+    if is_manufacturing_mongo_source(dialogue):
+        async for event in stream_manufacturing_mongo_query(dialogue):
+            yield event
+        return
     if _declares_governed_query_contract(dialogue):
         from dbgpt_app.scene.chat_db.governed_query_stream import (
             stream_governed_query_contract,
