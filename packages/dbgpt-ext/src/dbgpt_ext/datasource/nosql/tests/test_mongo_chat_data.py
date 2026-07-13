@@ -422,6 +422,68 @@ def test_query_plan_allows_schema_bound_read_only_project(monkeypatch):
     assert rows == [{"station": "Pur_Aoi", "sample_count": 2}]
 
 
+def test_query_plan_allows_projecting_the_metric_relevant_to_the_question():
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "timeField": "timestamp",
+            "groupField": "machineId",
+            "groupLabel": "station",
+            "metrics": [
+                {"name": "sample_count", "op": "count"},
+                {"name": "avg_thickness", "op": "avg", "field": "AvgThk"},
+            ],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                """
+                {
+                  "pipeline": [
+                    {
+                      "$group": {
+                        "_id": "$machineId",
+                        "sample_count": {"$sum": 1},
+                        "avg_thickness": {"$avg": "$AvgThk"}
+                      }
+                    },
+                    {
+                      "$project": {
+                        "_id": 0,
+                        "station": "$_id",
+                        "avg_thickness": 1
+                      }
+                    },
+                    {"$sort": {"avg_thickness": -1}}
+                  ],
+                  "reason": "Rank stations by the requested thickness metric."
+                }
+                """
+            )
+        ]
+    )
+
+    query_plan, _ = asyncio.run(
+        app.plan_query(
+            prompt="find the station with the highest average thickness",
+            model="glm5.2",
+            worker_manager=worker_manager,
+            conv_uid="run-project-relevant-metric",
+        )
+    )
+
+    assert query_plan.pipeline[1]["$project"] == {
+        "_id": 0,
+        "station": "$_id",
+        "avg_thickness": 1,
+    }
+
+
 @pytest.mark.parametrize(
     ("project", "message"),
     [
