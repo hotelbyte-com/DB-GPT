@@ -11,7 +11,7 @@ requires-python = ">= 3.10"
 
 dependencies = [
     "dbgpt-acc-auto",
-    "dbgpt[client,cli,agent,simple_framework,framework,code,proxy_openai,proxy_tongyi,proxy_zhipuai]",
+    "dbgpt[client,cli,agent,simple_framework,framework,code,proxy_openai,proxy_anthropic,proxy_tongyi,proxy_zhipuai]",
     "dbgpt-ext[rag,storage_chromadb,datasource_redis,datasource_mongo,embedding_ollama,file_minio]",
     "dbgpt-serve",
     "dbgpt-client",
