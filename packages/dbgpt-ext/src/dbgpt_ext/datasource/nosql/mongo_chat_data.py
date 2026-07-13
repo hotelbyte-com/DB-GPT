@@ -680,7 +680,9 @@ def _validate_add_fields(
 ) -> List[str]:
     if not isinstance(add_fields, Mapping):
         raise ValueError("Mongo chat_data $addFields must be an object")
-    allowed_outputs = set(_derived_output_fields(app))
+    allowed_outputs = set(_metric_output_fields(app)) | set(
+        _derived_output_fields(app)
+    )
     if app.group_label:
         allowed_outputs.add(app.group_label)
     if app.group_field:

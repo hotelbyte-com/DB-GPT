@@ -284,6 +284,68 @@ def test_query_plan_rejects_unconfigured_add_fields_output():
         )
 
 
+def test_query_plan_allows_configured_metric_add_fields_output():
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "timeField": "timestamp",
+            "groupField": "machineId",
+            "metrics": [
+                {"name": "sample_count", "op": "count"},
+                {
+                    "name": "spa000_bool_count",
+                    "op": "sumBoolTrue",
+                    "field": "Spa000_BOOL",
+                },
+            ],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                """
+                {
+                  "pipeline": [
+                    {
+                      "$addFields": {
+                        "spa000_bool_count": {
+                          "$cond": [{"$eq": ["$Spa000_BOOL", true]}, 1, 0]
+                        }
+                      }
+                    },
+                    {
+                      "$group": {
+                        "_id": "$machineId",
+                        "sample_count": {"$sum": 1},
+                        "spa000_bool_count": {"$sum": "$spa000_bool_count"}
+                      }
+                    }
+                  ],
+                  "reason": "Count configured PLC boolean alarms by machine."
+                }
+                """
+            )
+        ]
+    )
+
+    query_plan, _ = asyncio.run(
+        app.plan_query(
+            prompt="count current PLC boolean alarms",
+            model="glm5.2",
+            worker_manager=worker_manager,
+            conv_uid="run-configured-metric-add-fields",
+        )
+    )
+
+    assert query_plan.pipeline[0]["$addFields"]["spa000_bool_count"] == {
+        "$cond": [{"$eq": ["$Spa000_BOOL", True]}, 1, 0]
+    }
+
+
 def test_router_answer_returns_executed_query_plan_artifact(monkeypatch):
     app = mongo_chat_data.MongoChatDataApp.from_mapping(
         "manufacturing",
