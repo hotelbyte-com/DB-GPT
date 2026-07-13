@@ -696,8 +696,7 @@ def _validate_pipeline(app: MongoChatDataApp, pipeline: List[Dict[str, Any]]) ->
         elif stage_name == "$sort":
             _validate_sort(app, payload, available_fields)
         elif stage_name == "$group":
-            _validate_group(app, payload, available_fields)
-            available_fields = {"_id"} | set(_metric_output_fields(app))
+            available_fields = _validate_group(app, payload, available_fields)
         elif stage_name == "$addFields":
             new_fields = _validate_add_fields(app, payload, available_fields)
             available_fields.update(new_fields)
@@ -756,15 +755,28 @@ def _validate_sort(
 
 def _validate_group(
     app: MongoChatDataApp, group: Any, available_fields: Optional[Iterable[str]] = None
-) -> None:
+) -> set[str]:
     if not isinstance(group, Mapping):
         raise ValueError("Mongo chat_data $group must be an object")
     if "_id" not in group:
         raise ValueError("Mongo chat_data $group must include _id")
     _validate_expression(app, group.get("_id"), available_fields)
     metric_fields = set(_metric_output_fields(app))
+    identity_aliases = {app.group_field, app.group_label}
+    group_outputs = {"_id"}
     for field_name, expression in group.items():
         if field_name == "_id":
+            continue
+        if field_name in identity_aliases:
+            if expression not in (
+                {"$first": f"${app.group_field}"},
+                {"$last": f"${app.group_field}"},
+            ):
+                raise ValueError(
+                    "Mongo chat_data $group identity alias must retain the "
+                    "configured group field"
+                )
+            group_outputs.add(field_name)
             continue
         if field_name not in metric_fields:
             raise ValueError(
@@ -781,6 +793,8 @@ def _validate_group(
                 f"Mongo chat_data $group operator {operator!r} is not allowed"
             )
         _validate_expression(app, expression, available_fields)
+        group_outputs.add(field_name)
+    return group_outputs
 
 
 def _validate_add_fields(
@@ -867,7 +881,11 @@ def _validate_project(
         )
     if app.group_field and "_id" in available and "_id" not in retained:
         identity_aliases = {app.group_label, app.group_field}
-        if not any(project.get(alias) == "$_id" for alias in identity_aliases):
+        if not any(
+            project.get(alias) == "$_id"
+            or (alias in available and project.get(alias) == 1)
+            for alias in identity_aliases
+        ):
             raise ValueError(
                 "Mongo chat_data $project cannot remove group identity "
                 "without a configured identity alias"
