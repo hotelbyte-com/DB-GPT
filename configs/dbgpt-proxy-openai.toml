@@ -54,6 +54,27 @@ provider = "proxy/deepseek"
 api_base = "https://api.deepseek.com/v1"
 api_key = "${env:DEEPSEEK_API_KEY}"
 
+# Manufacturing runtime aliases. These names are part of the Go-side typed
+# routing contract; credentials remain owned by the deployed environment.
+[[models.llms]]
+name = "MiniMax-M3"
+provider = "proxy/claude"
+api_base = "https://api.minimax.io/anthropic"
+api_key = "${env:MINIMAX_M3_API_KEY}"
+
+[[models.llms]]
+name = "kimi2.7"
+provider = "proxy/claude"
+api_base = "https://api.kimi.com/coding/"
+api_key = "${env:KIMI27_API_KEY}"
+
+[[models.llms]]
+name = "glm5.2"
+provider = "proxy/claude"
+api_base = "https://api.z.ai/api/anthropic"
+api_key = "${env:ZAI_ANTHROPIC_API_KEY}"
+backend = "glm-5.2"
+
 # Embedding: Ollama local (nomic-embed-text, 768-dim)
 [[models.embeddings]]
 name = "nomic-embed-text"
