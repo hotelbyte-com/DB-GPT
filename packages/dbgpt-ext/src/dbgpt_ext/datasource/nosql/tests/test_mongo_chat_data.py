@@ -448,6 +448,7 @@ def test_query_plan_allows_projecting_the_metric_relevant_to_the_question():
                     {
                       "$group": {
                         "_id": "$machineId",
+                        "station": {"$first": "$machineId"},
                         "sample_count": {"$sum": 1},
                         "avg_thickness": {"$avg": "$AvgThk"}
                       }
@@ -455,7 +456,7 @@ def test_query_plan_allows_projecting_the_metric_relevant_to_the_question():
                     {
                       "$project": {
                         "_id": 0,
-                        "station": "$_id",
+                        "station": 1,
                         "avg_thickness": 1
                       }
                     },
@@ -479,7 +480,7 @@ def test_query_plan_allows_projecting_the_metric_relevant_to_the_question():
 
     assert query_plan.pipeline[1]["$project"] == {
         "_id": 0,
-        "station": "$_id",
+        "station": 1,
         "avg_thickness": 1,
     }
 
