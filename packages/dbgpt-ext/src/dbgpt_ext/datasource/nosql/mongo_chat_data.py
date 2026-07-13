@@ -861,11 +861,9 @@ def _validate_project(
         included.add("_id")
     retained = included if has_inclusion else available - excluded
     required_metrics = set(_metric_output_fields(app)) & available
-    missing_metrics = sorted(required_metrics - retained)
-    if missing_metrics:
+    if required_metrics and not required_metrics & retained:
         raise ValueError(
-            "Mongo chat_data $project must retain configured metric fields: "
-            + ", ".join(missing_metrics)
+            "Mongo chat_data $project must retain at least one configured metric field"
         )
     if app.group_field and "_id" in available and "_id" not in retained:
         identity_aliases = {app.group_label, app.group_field}
