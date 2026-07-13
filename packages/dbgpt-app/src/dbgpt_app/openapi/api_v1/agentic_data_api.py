@@ -26,6 +26,7 @@ from dbgpt.model.cluster import WorkerManagerFactory
 from dbgpt_app.openapi.api_v1.react_agent_sse import (
     REACT_AGENT_ERROR_MESSAGES,
     classify_react_agent_error,
+    close_terminate_step,
     emit_react_agent_event,
     terminal_error_events,
 )
@@ -4416,9 +4417,8 @@ Action Input: The JSON format of tool parameters
                 else:
                     action_input_data = action_input
 
-            # Skip step display for terminate action — its output will be
-            # sent as a streaming "final" event instead of a step card.
-            # Also skip emitting the thought for terminate since it's noise.
+            # Do not display terminate content as a step card. A thinking_chunk
+            # may already have opened the round, so close that exact step first.
             # Note: TerminateAction.run() sets terminate=True but does NOT
             # set the action field, so we must check the terminate boolean.
             is_terminate = action_output.get("terminate") or (
@@ -4428,6 +4428,9 @@ Action Input: The JSON format of tool parameters
                 pending_thoughts.pop(round_num, [])
                 pending_action_intentions.pop(round_num, None)
                 pending_action_reasons.pop(round_num, None)
+                terminate_step_event = close_terminate_step(round_step_map, round_num)
+                if terminate_step_event:
+                    yield terminate_step_event
                 # ── Auto-complete all remaining todos on terminate ──
                 if _todo_list:
                     for t in _todo_list:

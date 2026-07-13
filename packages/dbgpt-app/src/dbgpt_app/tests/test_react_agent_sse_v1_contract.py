@@ -6,6 +6,7 @@ from dbgpt_app.openapi.api_v1.react_agent_sse import (
     REACT_AGENT_SSE_V1,
     REACT_AGENT_SSE_V1_REGISTRY,
     classify_react_agent_error,
+    close_terminate_step,
     emit_react_agent_event,
     terminal_error_events,
 )
@@ -101,3 +102,24 @@ def test_terminal_failure_is_error_then_failed_done_never_final(exc, code):
     assert events[0]["status"] == "failed"
     assert events[1]["status"] == "failed"
     assert all(event["type"] != "final" for event in events)
+
+
+def test_terminate_round_closes_its_started_step_before_final_and_done():
+    round_step_map = {9: "step-9"}
+
+    terminal_lines = [
+        close_terminate_step(round_step_map, 9),
+        emit_react_agent_event({"type": "final", "content": "answer"}),
+        emit_react_agent_event({"type": "done", "status": "done"}),
+    ]
+    events = [_payload(line) for line in terminal_lines]
+
+    assert [event["type"] for event in events] == ["step.done", "final", "done"]
+    assert events[0] == {
+        "contractVersion": REACT_AGENT_SSE_V1,
+        "type": "step.done",
+        "id": "step-9",
+        "status": "done",
+    }
+    assert close_terminate_step(round_step_map, 9) is None
+    assert close_terminate_step({}, 10) is None
