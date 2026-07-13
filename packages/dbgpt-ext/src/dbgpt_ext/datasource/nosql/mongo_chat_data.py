@@ -45,7 +45,7 @@ _DATA_PROVENANCE_FIELDS = frozenset(
 )
 _SHA256_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-_ALLOWED_STAGES = {"$match", "$sort", "$group", "$addFields", "$limit"}
+_ALLOWED_STAGES = {"$match", "$sort", "$group", "$addFields", "$project", "$limit"}
 _ALLOWED_MATCH_OPERATORS = {"$gte", "$gt", "$lte", "$lt", "$eq", "$in", "$ne"}
 _ALLOWED_GROUP_OPERATORS = {
     "$sum",
@@ -701,6 +701,8 @@ def _validate_pipeline(app: MongoChatDataApp, pipeline: List[Dict[str, Any]]) ->
         elif stage_name == "$addFields":
             new_fields = _validate_add_fields(app, payload, available_fields)
             available_fields.update(new_fields)
+        elif stage_name == "$project":
+            available_fields = _validate_project(app, payload, available_fields)
         elif stage_name == "$limit":
             limit = _int_limit(payload)
             if limit > app.row_limit:
@@ -804,6 +806,77 @@ def _validate_add_fields(
         _validate_expression(app, expression, available_fields)
         added.append(str(field_name))
     return added
+
+
+def _validate_project(
+    app: MongoChatDataApp, project: Any, available_fields: Iterable[str]
+) -> set[str]:
+    if not isinstance(project, Mapping) or not project:
+        raise ValueError("Mongo chat_data $project must be a non-empty object")
+    available = set(available_fields)
+    allowed_outputs = (
+        available
+        | set(_metric_output_fields(app))
+        | set(_derived_output_fields(app))
+        | {app.group_field, app.group_label, "_id"}
+    )
+    included: set[str] = set()
+    excluded: set[str] = set()
+    has_inclusion = False
+    has_exclusion = False
+    for raw_name, expression in project.items():
+        field_name = str(raw_name)
+        if (
+            field_name.startswith("$")
+            or "." in field_name
+            or field_name not in allowed_outputs
+        ):
+            raise ValueError(
+                f"Mongo chat_data $project output {field_name!r} is not configured"
+            )
+        if (
+            isinstance(expression, int)
+            and not isinstance(expression, bool)
+            and expression in (0, 1)
+        ):
+            if expression == 0:
+                excluded.add(field_name)
+                if field_name != "_id":
+                    has_exclusion = True
+                continue
+            if field_name not in available:
+                raise ValueError(
+                    f"Mongo chat_data $project inclusion {field_name!r} "
+                    "is not available"
+                )
+            has_inclusion = True
+            included.add(field_name)
+            continue
+        has_inclusion = True
+        _validate_expression(app, expression, available)
+        included.add(field_name)
+    if has_inclusion and has_exclusion:
+        raise ValueError("Mongo chat_data $project cannot mix inclusion and exclusion")
+    if has_inclusion and "_id" in available and project.get("_id") != 0:
+        included.add("_id")
+    retained = included if has_inclusion else available - excluded
+    required_metrics = set(_metric_output_fields(app)) & available
+    missing_metrics = sorted(required_metrics - retained)
+    if missing_metrics:
+        raise ValueError(
+            "Mongo chat_data $project must retain configured metric fields: "
+            + ", ".join(missing_metrics)
+        )
+    if app.group_field and "_id" in available and "_id" not in retained:
+        identity_aliases = {app.group_label, app.group_field}
+        if not any(project.get(alias) == "$_id" for alias in identity_aliases):
+            raise ValueError(
+                "Mongo chat_data $project cannot remove group identity "
+                "without a configured identity alias"
+            )
+    if has_inclusion:
+        return included
+    return available - excluded
 
 
 def _validate_expression(
@@ -937,7 +1010,12 @@ def _collection(app: MongoChatDataApp):
 def _normalize_row(app: MongoChatDataApp, row: Mapping[str, Any]) -> Dict[str, Any]:
     out = dict(app.row_defaults)
     if app.group_field:
-        out[app.group_label] = row.get("_id") or "unknown"
+        identity = row.get("_id")
+        for alias in (app.group_label, app.group_field):
+            if identity not in (None, ""):
+                break
+            identity = row.get(alias)
+        out[app.group_label] = identity if identity not in (None, "") else "unknown"
     for name in _iter_metric_names(app.metrics):
         out[name] = _jsonable(_round(row.get(name)))
     for spec in app.derived:

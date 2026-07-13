@@ -358,6 +358,172 @@ def test_query_plan_allows_configured_metric_add_fields_output():
     }
 
 
+def test_query_plan_allows_schema_bound_read_only_project(monkeypatch):
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "timeField": "timestamp",
+            "groupField": "machineId",
+            "groupLabel": "station",
+            "metrics": [{"name": "sample_count", "op": "count"}],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                """
+                {
+                  "pipeline": [
+                    {"$group": {"_id": "$machineId", "sample_count": {"$sum": 1}}},
+                    {
+                      "$project": {
+                        "_id": 0,
+                        "station": "$_id",
+                        "sample_count": 1
+                      }
+                    },
+                    {"$sort": {"station": 1}}
+                  ],
+                  "reason": "Expose only the configured station and sample count."
+                }
+                """
+            )
+        ]
+    )
+
+    query_plan, _ = asyncio.run(
+        app.plan_query(
+            prompt="current line status",
+            model="glm5.2",
+            worker_manager=worker_manager,
+            conv_uid="run-project",
+        )
+    )
+
+    assert query_plan.pipeline[1]["$project"] == {
+        "_id": 0,
+        "station": "$_id",
+        "sample_count": 1,
+    }
+    assert query_plan.pipeline[2] == {"$sort": {"station": 1}}
+
+    class FakeCollection:
+        def aggregate(self, pipeline, allowDiskUse):
+            assert allowDiskUse is True
+            assert pipeline == query_plan.pipeline
+            return [{"station": "Pur_Aoi", "sample_count": 2}]
+
+    monkeypatch.setattr(mongo_chat_data, "_collection", lambda _: FakeCollection())
+    rows, _ = app.query(query_plan)
+    assert rows == [{"station": "Pur_Aoi", "sample_count": 2}]
+
+
+@pytest.mark.parametrize(
+    ("project", "message"),
+    [
+        ({"secret": "$machineId"}, "secret"),
+        ({"station": 1}, "station"),
+        ({"_id": 0, "sample_count": 0, "station": "$_id"}, "mix"),
+        ({"station": {"$function": {"body": "return 1"}}}, r"\$function"),
+        ({"nested.station": "$_id"}, "nested.station"),
+        ({"_id": 0, "station": "$_id"}, "metric"),
+        ({"_id": 0, "sample_count": 1}, "identity"),
+    ],
+)
+def test_query_plan_rejects_unsafe_or_unconfigured_project(project, message):
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "timeField": "timestamp",
+            "groupField": "machineId",
+            "groupLabel": "station",
+            "metrics": [{"name": "sample_count", "op": "count"}],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                json.dumps(
+                    {
+                        "pipeline": [
+                            {
+                                "$group": {
+                                    "_id": "$machineId",
+                                    "sample_count": {"$sum": 1},
+                                }
+                            },
+                            {"$project": project},
+                        ],
+                        "reason": "unsafe projection",
+                    }
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            app.plan_query(
+                prompt="current line status",
+                model="glm5.2",
+                worker_manager=worker_manager,
+                conv_uid="run-project-reject",
+            )
+        )
+
+
+@pytest.mark.parametrize("stage", ["$out", "$merge"])
+def test_query_plan_rejects_mongo_write_stages(stage):
+    app = mongo_chat_data.MongoChatDataApp.from_mapping(
+        "manufacturing",
+        {
+            "uri": "mongodb://127.0.0.1:27017",
+            "database": "ITDU",
+            "collection": "ITDU_PLCData",
+            "source": "mongodb.ITDU.ITDU_PLCData",
+            "groupField": "machineId",
+            "metrics": [{"name": "sample_count", "op": "count"}],
+        },
+    )
+    worker_manager = FakeWorkerManager(
+        [
+            FakeModelOutput(
+                json.dumps(
+                    {
+                        "pipeline": [
+                            {
+                                "$group": {
+                                    "_id": "$machineId",
+                                    "sample_count": {"$sum": 1},
+                                }
+                            },
+                            {stage: "forbidden"},
+                        ]
+                    }
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="not allowed"):
+        asyncio.run(
+            app.plan_query(
+                prompt="write the result",
+                model="glm5.2",
+                worker_manager=worker_manager,
+                conv_uid="run-write-stage-reject",
+            )
+        )
+
+
 def test_router_answer_returns_executed_query_plan_artifact(monkeypatch):
     app = mongo_chat_data.MongoChatDataApp.from_mapping(
         "manufacturing",
