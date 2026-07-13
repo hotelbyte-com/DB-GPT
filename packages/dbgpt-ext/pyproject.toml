@@ -88,6 +88,7 @@ storage_valkey = ["valkey-glide>=2.3.0"]
 file_oss = [
     "oss2" # Aliyun OSS
 ]
+file_minio = ["minio==7.2.20"]
 file_s3 = [
     "boto3"
 ]

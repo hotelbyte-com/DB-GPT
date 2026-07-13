@@ -5882,7 +5882,7 @@ dependencies = [
     { name = "dbgpt", extra = ["agent", "cli", "client", "code", "framework", "proxy-openai", "proxy-tongyi", "proxy-zhipuai", "simple-framework"] },
     { name = "dbgpt-acc-auto" },
     { name = "dbgpt-client" },
-    { name = "dbgpt-ext", extra = ["datasource-mongo", "datasource-redis", "embedding-ollama", "rag", "storage-chromadb"] },
+    { name = "dbgpt-ext", extra = ["datasource-mongo", "datasource-redis", "embedding-ollama", "file-minio", "rag", "storage-chromadb"] },
     { name = "dbgpt-sandbox" },
     { name = "dbgpt-serve" },
     { name = "httpx" },
@@ -5915,7 +5915,7 @@ requires-dist = [
     { name = "dbgpt", extras = ["client", "cli", "agent", "simple-framework", "framework", "code", "proxy-openai", "proxy-tongyi", "proxy-zhipuai"], editable = "packages/dbgpt-core" },
     { name = "dbgpt-acc-auto", editable = "packages/dbgpt-accelerator/dbgpt-acc-auto" },
     { name = "dbgpt-client", editable = "packages/dbgpt-client" },
-    { name = "dbgpt-ext", extras = ["rag", "storage-chromadb", "datasource-redis", "datasource-mongo", "embedding-ollama"], editable = "packages/dbgpt-ext" },
+    { name = "dbgpt-ext", extras = ["rag", "storage-chromadb", "datasource-redis", "datasource-mongo", "embedding-ollama", "file-minio"], editable = "packages/dbgpt-ext" },
     { name = "dbgpt-sandbox", editable = "packages/dbgpt-sandbox" },
     { name = "dbgpt-serve", editable = "packages/dbgpt-serve" },
     { name = "httpx", specifier = ">=0.24.0" },
@@ -6007,6 +6007,9 @@ datasource-vertica = [
 embedding-ollama = [
     { name = "ollama" },
 ]
+file-minio = [
+    { name = "minio" },
+]
 file-oss = [
     { name = "oss2" },
 ]
@@ -6068,6 +6071,7 @@ requires-dist = [
     { name = "duckdb-engine", marker = "extra == 'datasource-duckdb'", specifier = "==0.9.1" },
     { name = "elasticsearch", marker = "extra == 'storage-elasticsearch'" },
     { name = "markdown", marker = "extra == 'rag'" },
+    { name = "minio", marker = "extra == 'file-minio'", specifier = "==7.2.20" },
     { name = "mysqlclient", marker = "extra == 'datasource-mysql'", specifier = "==2.1.0" },
     { name = "neo4j", marker = "extra == 'graph-rag'" },
     { name = "networkx", marker = "extra == 'graph-rag'" },
@@ -6097,7 +6101,7 @@ requires-dist = [
     { name = "vertica-python", marker = "extra == 'datasource-vertica'" },
     { name = "weaviate-client", marker = "extra == 'storage-weaviate'" },
 ]
-provides-extras = ["rag", "graph-rag", "datasource-mysql", "datasource-oracle", "datasource-postgres", "datasource-clickhouse", "datasource-spark", "datasource-mssql", "datasource-hive", "datasource-vertica", "datasource-duckdb", "datasource-redis", "datasource-mongo", "embedding-ollama", "storage-milvus", "storage-weaviate", "storage-chromadb", "storage-elasticsearch", "storage-qdrant", "storage-obvector", "storage-valkey", "file-oss", "file-s3"]
+provides-extras = ["rag", "graph-rag", "datasource-mysql", "datasource-oracle", "datasource-postgres", "datasource-clickhouse", "datasource-spark", "datasource-mssql", "datasource-hive", "datasource-vertica", "datasource-duckdb", "datasource-redis", "datasource-mongo", "embedding-ollama", "storage-milvus", "storage-weaviate", "storage-chromadb", "storage-elasticsearch", "storage-qdrant", "storage-obvector", "storage-valkey", "file-oss", "file-minio", "file-s3"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.3.4" }]
@@ -12720,6 +12724,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a5/a7/11c21f2d6f3299ad07af8142b007e4297ff12d4bdc53e1e1ba48f661954b/milvus_lite-2.4.12-py3-none-macosx_11_0_arm64.whl", hash = "sha256:20087663e7b4385050b7ad08f1f03404426d4c87b1ff91d5a8723eee7fd49e88", size = 17411635, upload-time = "2025-03-21T06:20:43.548Z" },
     { url = "https://files.pythonhosted.org/packages/a8/cc/b6f465e984439adf24da0a8ff3035d5c9ece30b6ff19f9a53f73f9ef901a/milvus_lite-2.4.12-py3-none-manylinux2014_aarch64.whl", hash = "sha256:a0f3a5ddbfd19f4a6b842b2fd3445693c796cde272b701a1646a94c1ac45d3d7", size = 35693118, upload-time = "2025-03-21T06:21:14.921Z" },
     { url = "https://files.pythonhosted.org/packages/44/43/b3f6e9defd1f3927b972beac7abe3d5b4a3bdb287e3bad69618e2e76cf0a/milvus_lite-2.4.12-py3-none-manylinux2014_x86_64.whl", hash = "sha256:334037ebbab60243b5d8b43d54ca2f835d81d48c3cda0c6a462605e588deb05d", size = 45182549, upload-time = "2025-03-21T06:21:45.425Z" },
+]
+
+[[package]]
+name = "minio"
+version = "7.2.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "argon2-cffi" },
+    { name = "certifi" },
+    { name = "pycryptodome" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/df/6dfc6540f96a74125a11653cce717603fd5b7d0001a8e847b3e54e72d238/minio-7.2.20.tar.gz", hash = "sha256:95898b7a023fbbfde375985aa77e2cd6a0762268db79cf886f002a9ea8e68598", size = 136113, upload-time = "2025-11-27T00:37:15.569Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/9a/b697530a882588a84db616580f2ba5d1d515c815e11c30d219145afeec87/minio-7.2.20-py3-none-any.whl", hash = "sha256:eb33dd2fb80e04c3726a76b13241c6be3c4c46f8d81e1d58e757786f6501897e", size = 93751, upload-time = "2025-11-27T00:37:13.993Z" },
 ]
 
 [[package]]
