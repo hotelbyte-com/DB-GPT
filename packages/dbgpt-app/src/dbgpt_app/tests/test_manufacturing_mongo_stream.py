@@ -44,13 +44,14 @@ def _dialogue(*, read_only: bool = True) -> ConversationVo:
 class _MongoRouter:
     def __init__(self) -> None:
         self.calls = []
+        self.response = None
 
     def can_handle(self, chat_param):
         return chat_param == "manufacturing"
 
     async def answer(self, **kwargs):
         self.calls.append(kwargs)
-        return {
+        self.response = {
             "choices": [
                 {
                     "index": 0,
@@ -71,12 +72,21 @@ class _MongoRouter:
                 "chat_param": "manufacturing",
                 "rows": [],
             },
+            "provenance": {
+                "contractVersion": "data-provenance.v1",
+                "source": "ITDU.ITDU_PLCData",
+                "schemaFingerprint": "sha256:" + "a" * 64,
+                "compiledPlanFingerprint": "sha256:" + "b" * 64,
+                "resultFingerprint": "sha256:" + "c" * 64,
+                "rowCount": 0,
+            },
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15,
             },
         }
+        return self.response
 
 
 def test_manufacturing_source_without_contract_still_routes_to_fail_closed_stream():
@@ -115,16 +125,35 @@ async def test_manufacturing_mongo_stream_uses_real_router_contract_and_strict_s
     ]
     assert all(event["contractVersion"] == "react-agent-sse.v1" for event in events)
     assert [events[-2]["status"], events[-1]["status"]] == ["success", "done"]
-    assert events[3]["content"] == {
-        "artifactType": "mongo.data.result",
-        "source": "ITDU.ITDU_PLCData",
-        "rowCount": 0,
-    }
+    assert events[3]["content"] == router.response["provenance"]
+    assert events[3]["content"]["contractVersion"] == "data-provenance.v1"
     assert router.calls[0]["chat_param"] == "manufacturing"
     assert router.calls[0]["model"] == "MiniMax-M3"
     prompt = router.calls[0]["prompt"]
     assert prompt.index("2026-07-13T02:22:26Z") < prompt.index("2000-01-01T00:00:00Z")
     assert "No rows were returned" in events[-2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_manufacturing_mongo_stream_rejects_unbound_provenance_receipt():
+    class _MismatchedProvenanceRouter(_MongoRouter):
+        async def answer(self, **kwargs):
+            response = await super().answer(**kwargs)
+            response["provenance"]["rowCount"] = 1
+            return response
+
+    router = _MismatchedProvenanceRouter()
+    events = [
+        json.loads(line.removeprefix("data: "))
+        async for line in stream_manufacturing_mongo_query(
+            _dialogue(),
+            router=router,
+            worker_manager=object(),
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["error", "done"]
+    assert events[-1]["status"] == "failed"
 
 
 @pytest.mark.asyncio

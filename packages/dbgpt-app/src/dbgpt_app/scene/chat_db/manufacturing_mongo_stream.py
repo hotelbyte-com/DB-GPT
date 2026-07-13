@@ -16,7 +16,10 @@ from dbgpt_app.openapi.api_v1.react_agent_sse import (
     terminal_error_events,
 )
 from dbgpt_app.openapi.api_view_model import ConversationVo
-from dbgpt_ext.datasource.nosql.mongo_chat_data import MongoChatDataRouter
+from dbgpt_ext.datasource.nosql.mongo_chat_data import (
+    MongoChatDataRouter,
+    validate_data_provenance,
+)
 
 MANUFACTURING_DATA_AGENT_SOURCE = "manufacturing-agent-os-data-agent"
 MANUFACTURING_QUERY_CONTRACT_VERSION = "manufacturing.data-query/v1"
@@ -169,13 +172,18 @@ def _validated_response_receipt(response: Any) -> tuple[str, Dict[str, Any]]:
         raise ValueError("manufacturing Mongo response has no typed evidence")
     rows = raw.get("rows")
     source = raw.get("source")
-    artifact_type = artifact.get("type")
     if not isinstance(rows, list) or not isinstance(source, str) or not source.strip():
         raise ValueError("manufacturing Mongo response source receipt is incomplete")
+    artifact_rows = artifact.get("rows")
+    artifact_source = artifact.get("source")
+    artifact_type = artifact.get("type")
     if not isinstance(artifact_type, str) or not artifact_type.strip():
         raise ValueError("manufacturing Mongo response artifact receipt is incomplete")
-    return content.strip(), {
-        "artifactType": artifact_type,
-        "source": source,
-        "rowCount": len(rows),
-    }
+    if artifact_source != source or artifact_rows != rows:
+        raise ValueError("manufacturing Mongo response evidence is inconsistent")
+    provenance = validate_data_provenance(
+        response.get("provenance"),
+        source=source,
+        row_count=len(rows),
+    )
+    return content.strip(), provenance

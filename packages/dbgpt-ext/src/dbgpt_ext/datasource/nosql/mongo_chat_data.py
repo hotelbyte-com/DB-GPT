@@ -8,6 +8,7 @@ hands the resulting facts back to the model for interpretation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,19 @@ except Exception:  # pragma: no cover - reported as a runtime configuration gap.
 
 CONFIG_FILE_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG_FILE"
 CONFIG_JSON_ENV = "DBGPT_MONGO_CHAT_DATA_CONFIG"
+DATA_PROVENANCE_CONTRACT_VERSION = "data-provenance.v1"
+
+_DATA_PROVENANCE_FIELDS = frozenset(
+    {
+        "contractVersion",
+        "source",
+        "schemaFingerprint",
+        "compiledPlanFingerprint",
+        "resultFingerprint",
+        "rowCount",
+    }
+)
+_SHA256_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _ALLOWED_STAGES = {"$match", "$sort", "$group", "$addFields", "$limit"}
 _ALLOWED_MATCH_OPERATORS = {"$gte", "$gt", "$lte", "$lt", "$eq", "$in", "$ne"}
@@ -83,6 +97,7 @@ class MongoSummaryMetricSpec:
 class MongoQueryPlan:
     pipeline: List[Dict[str, Any]]
     reason: str = ""
+    planner_schema: Dict[str, Any] = dc_field(default_factory=dict)
 
 
 @dataclass
@@ -179,12 +194,14 @@ class MongoChatDataApp:
         worker_manager: WorkerManager,
         conv_uid: Optional[str],
     ) -> Tuple[MongoQueryPlan, Dict[str, int]]:
+        planner_schema = _planner_schema(self)
         model_output = await worker_manager.generate(
             _query_plan_request_dict(
                 app=self,
                 prompt=prompt,
                 model=model,
                 conv_uid=conv_uid,
+                planner_schema=planner_schema,
             )
         )
         if not model_output.success:
@@ -192,6 +209,7 @@ class MongoChatDataApp:
         query_plan = _parse_query_plan(model_output.text)
         query_plan.pipeline = _guard_pipeline(self, query_plan.pipeline, prompt)
         _validate_pipeline(self, query_plan.pipeline)
+        query_plan.planner_schema = planner_schema
         return query_plan, _usage_from_model(model_output.usage)
 
     def query(
@@ -291,6 +309,12 @@ class MongoChatDataRouter:
         )
         combined_usage = _merge_usage(plan_usage, usage)
         query_plan_payload = _query_plan_payload(app, query_plan)
+        provenance = _data_provenance(
+            app=app,
+            planner_schema=query_plan.planner_schema,
+            query_plan=query_plan_payload,
+            rows=rows,
+        )
         return {
             "id": conv_uid or f"mongo-chat-data-{chat_param}",
             "object": "chat.completion",
@@ -313,6 +337,7 @@ class MongoChatDataRouter:
                 "queryPlan": query_plan_payload,
                 "rows": rows,
             },
+            "provenance": provenance,
             "usage": combined_usage
             or {
                 "prompt_tokens": 0,
@@ -420,6 +445,81 @@ def _compact_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _canonical_json(data: Any) -> bytes:
+    return json.dumps(
+        _jsonable(data),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _fingerprint(data: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(data)).hexdigest()
+
+
+def _data_provenance(
+    *,
+    app: MongoChatDataApp,
+    planner_schema: Mapping[str, Any],
+    query_plan: Mapping[str, Any],
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not planner_schema:
+        raise ValueError("Mongo chat_data planner schema provenance is unavailable")
+    return {
+        "contractVersion": DATA_PROVENANCE_CONTRACT_VERSION,
+        "source": app.source,
+        "schemaFingerprint": _fingerprint(planner_schema),
+        "compiledPlanFingerprint": _fingerprint(query_plan),
+        "resultFingerprint": _fingerprint({"source": app.source, "rows": rows}),
+        "rowCount": len(rows),
+    }
+
+
+def validate_data_provenance(
+    provenance: Any,
+    *,
+    source: str,
+    row_count: int,
+) -> Dict[str, Any]:
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Mongo chat_data response provenance is not an object")
+    if set(provenance) != _DATA_PROVENANCE_FIELDS:
+        raise ValueError("Mongo chat_data response provenance fields are incomplete")
+    if provenance.get("contractVersion") != DATA_PROVENANCE_CONTRACT_VERSION:
+        raise ValueError("Mongo chat_data response provenance version is unsupported")
+    if provenance.get("source") != source:
+        raise ValueError("Mongo chat_data response provenance source is unbound")
+    receipt_row_count = provenance.get("rowCount")
+    if (
+        isinstance(receipt_row_count, bool)
+        or not isinstance(receipt_row_count, int)
+        or receipt_row_count != row_count
+    ):
+        raise ValueError("Mongo chat_data response provenance row count is unbound")
+    for field in (
+        "schemaFingerprint",
+        "compiledPlanFingerprint",
+        "resultFingerprint",
+    ):
+        value = provenance.get(field)
+        if not isinstance(value, str) or not _SHA256_FINGERPRINT.fullmatch(value):
+            raise ValueError(f"Mongo chat_data response provenance {field} is invalid")
+    return {
+        field: provenance[field]
+        for field in (
+            "contractVersion",
+            "source",
+            "schemaFingerprint",
+            "compiledPlanFingerprint",
+            "resultFingerprint",
+            "rowCount",
+        )
+    }
+
+
 def _find_user_question(prompt: str) -> str:
     text = (prompt or "").strip()
     if not text:
@@ -431,9 +531,37 @@ def _find_user_question(prompt: str) -> str:
 
 
 def _build_query_plan_prompt(
-    app: MongoChatDataApp, prompt: str
+    app: MongoChatDataApp,
+    prompt: str,
+    planner_schema: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, str]]:
-    schema = {
+    schema = dict(planner_schema or _planner_schema(app))
+    return [
+        {
+            "role": ModelMessageRoleType.HUMAN,
+            "content": (
+                "你是 DB-GPT chat_data 查询规划器。请根据用户问题和 Mongo schema 生成"
+                "只读 Mongo aggregation 查询计划。\n\n"
+                "硬性规则：\n"
+                "1. 只返回 JSON，不要 Markdown，不要解释。\n"
+                '2. JSON 结构必须是 {"pipeline": [...], "reason": "..."}。\n'
+                "3. pipeline 只能使用 schema.allowedStages 中的 stage，不能使用 $out、"
+                "$merge、$lookup、$function、$where 或写入类操作。\n"
+                "4. 只能引用 schema.sourceFields 中存在的源字段；如果用户上下文提到"
+                " factory/line/asset 但 schema 没有对应字段，不要添加这些过滤条件。\n"
+                "5. 如果用户 prompt 中提供时间窗，必须在 timeField 上使用这个时间窗。\n"
+                "6. 聚合输出字段名优先使用 schema.metrics.name，"
+                "便于下游生成稳定 artifact。\n\n"
+                f"Mongo schema（JSON）：{_compact_json(schema)}\n\n"
+                f"用户 prompt：{prompt}\n\n"
+                "请只返回 JSON。"
+            ),
+        }
+    ]
+
+
+def _planner_schema(app: MongoChatDataApp) -> Dict[str, Any]:
+    return {
         "chatDataApp": app.name,
         "source": app.source,
         "database": app.database,
@@ -467,28 +595,6 @@ def _build_query_plan_prompt(
         "allowedGroupOperators": sorted(_ALLOWED_GROUP_OPERATORS),
         "allowedExpressionOperators": sorted(_ALLOWED_EXPRESSION_OPERATORS),
     }
-    return [
-        {
-            "role": ModelMessageRoleType.HUMAN,
-            "content": (
-                "你是 DB-GPT chat_data 查询规划器。请根据用户问题和 Mongo schema 生成"
-                "只读 Mongo aggregation 查询计划。\n\n"
-                "硬性规则：\n"
-                "1. 只返回 JSON，不要 Markdown，不要解释。\n"
-                '2. JSON 结构必须是 {"pipeline": [...], "reason": "..."}。\n'
-                "3. pipeline 只能使用 schema.allowedStages 中的 stage，不能使用 $out、"
-                "$merge、$lookup、$function、$where 或写入类操作。\n"
-                "4. 只能引用 schema.sourceFields 中存在的源字段；如果用户上下文提到"
-                " factory/line/asset 但 schema 没有对应字段，不要添加这些过滤条件。\n"
-                "5. 如果用户 prompt 中提供时间窗，必须在 timeField 上使用这个时间窗。\n"
-                "6. 聚合输出字段名优先使用 schema.metrics.name，"
-                "便于下游生成稳定 artifact。\n\n"
-                f"Mongo schema（JSON）：{_compact_json(schema)}\n\n"
-                f"用户 prompt：{prompt}\n\n"
-                "请只返回 JSON。"
-            ),
-        }
-    ]
 
 
 def _parse_query_plan(text: str) -> MongoQueryPlan:
@@ -680,9 +786,7 @@ def _validate_add_fields(
 ) -> List[str]:
     if not isinstance(add_fields, Mapping):
         raise ValueError("Mongo chat_data $addFields must be an object")
-    allowed_outputs = set(_metric_output_fields(app)) | set(
-        _derived_output_fields(app)
-    )
+    allowed_outputs = set(_metric_output_fields(app)) | set(_derived_output_fields(app))
     if app.group_label:
         allowed_outputs.add(app.group_label)
     if app.group_field:
@@ -695,8 +799,7 @@ def _validate_add_fields(
             )
         if field_name not in allowed_outputs:
             raise ValueError(
-                f"Mongo chat_data $addFields output {field_name!r} is not "
-                "configured"
+                f"Mongo chat_data $addFields output {field_name!r} is not configured"
             )
         _validate_expression(app, expression, available_fields)
         added.append(str(field_name))
@@ -898,10 +1001,11 @@ def _query_plan_request_dict(
     prompt: str,
     model: str,
     conv_uid: Optional[str],
+    planner_schema: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     req = ModelRequest(
         model=model,
-        messages=_build_query_plan_prompt(app, prompt),
+        messages=_build_query_plan_prompt(app, prompt, planner_schema),
         temperature=0.0,
         max_new_tokens=1024,
         span_id=f"{conv_uid}:query-plan" if conv_uid else None,

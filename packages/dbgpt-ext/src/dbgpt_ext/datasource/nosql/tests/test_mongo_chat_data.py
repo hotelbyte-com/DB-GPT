@@ -1,8 +1,20 @@
 import asyncio
+import hashlib
+import json
 
 import pytest
 
 from dbgpt_ext.datasource.nosql import mongo_chat_data
+
+
+def _fingerprint(value):
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 class FakeModelOutput:
@@ -417,6 +429,38 @@ def test_router_answer_returns_executed_query_plan_artifact(monkeypatch):
         "prompt_tokens": 8,
         "completion_tokens": 10,
         "total_tokens": 18,
+    }
+    planner_schema = {
+        "chatDataApp": "manufacturing",
+        "source": "mongodb.ITDU.ITDU_PLCData",
+        "database": "ITDU",
+        "collection": "ITDU_PLCData",
+        "timeField": "timestamp",
+        "groupField": "machineId",
+        "groupLabel": "station",
+        "rowLimit": 10,
+        "sourceFields": ["machineId", "timestamp"],
+        "filterFields": [],
+        "metrics": [{"name": "sample_count", "op": "count", "field": "", "fields": []}],
+        "derived": [],
+        "allowedStages": sorted(mongo_chat_data._ALLOWED_STAGES),
+        "allowedMatchOperators": sorted(mongo_chat_data._ALLOWED_MATCH_OPERATORS),
+        "allowedGroupOperators": sorted(mongo_chat_data._ALLOWED_GROUP_OPERATORS),
+        "allowedExpressionOperators": sorted(
+            mongo_chat_data._ALLOWED_EXPRESSION_OPERATORS
+        ),
+    }
+    expected_result = {
+        "source": "mongodb.ITDU.ITDU_PLCData",
+        "rows": [{"station": "Pur_Aoi", "sample_count": 2}],
+    }
+    assert response["provenance"] == {
+        "contractVersion": "data-provenance.v1",
+        "source": "mongodb.ITDU.ITDU_PLCData",
+        "schemaFingerprint": _fingerprint(planner_schema),
+        "compiledPlanFingerprint": _fingerprint(query_plan),
+        "resultFingerprint": _fingerprint(expected_result),
+        "rowCount": 1,
     }
     assert len(worker_manager.requests) == 2
 
