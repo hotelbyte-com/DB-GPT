@@ -32,6 +32,7 @@ class ChatWithDbQA(BaseChat):
             chat_param.select_param,
             chat_param.real_user_input().last_text,
             system_app,
+            chat_param.ext_info,
         )
         chat_param.select_param = self.db_name
         self.database = None

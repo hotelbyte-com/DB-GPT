@@ -1082,6 +1082,33 @@ async def _react_agent_stream(
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
 
+    # Resolve a concrete datasource when the caller did not pin one explicitly.
+    # hotel-be sends select_param="hotel-be" (a logical group) plus, when a
+    # query_contract applies, an allowed_tables hint in ext_info. Without this
+    # resolution the ReAct agent has no datasource at all and sql_query either
+    # fails with "未选择数据库" or falls back to the wrong MySQL default — which
+    # is the root cause of "/agents 页面 sql 失败". We reuse the same router
+    # chat_data uses so TDengine (hblog_ns) becomes reachable for time-series
+    # questions instead of being excluded from the hotel-be group.
+    if not database_name and dialogue.select_param:
+        try:
+            from dbgpt_app.scene.chat_db.datasource_router import (
+                resolve_chat_data_source,
+            )
+
+            database_name = resolve_chat_data_source(
+                str(dialogue.select_param),
+                user_input,
+                CFG.SYSTEM_APP,
+                dialogue.ext_info if isinstance(dialogue.ext_info, dict) else None,
+            )
+        except Exception as e:
+            logger.warning(
+                "resolve_chat_data_source failed for react-agent select_param=%s: %s",
+                dialogue.select_param,
+                e,
+            )
+
     def build_step(title: str, detail: str, phase: str = None):
         nonlocal step
         step += 1
