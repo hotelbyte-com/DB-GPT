@@ -1336,6 +1336,34 @@ async def _general_react_agent_stream(
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
 
+    # Legacy requests without a governed query contract still need their logical
+    # group resolved to a physical datasource. Declared contracts are routed by
+    # _react_agent_stream before this general ReAct path and must never fall back
+    # to best-effort question scoring after a typed resolution failure.
+    if (
+        not database_name
+        and dialogue.select_param
+        and query_contract is None
+        and not contract_resolution_error
+    ):
+        try:
+            from dbgpt_app.scene.chat_db.datasource_router import (
+                resolve_chat_data_source,
+            )
+
+            database_name = resolve_chat_data_source(
+                str(dialogue.select_param),
+                user_input,
+                CFG.SYSTEM_APP,
+                dialogue.ext_info if isinstance(dialogue.ext_info, dict) else None,
+            )
+        except Exception as e:
+            logger.warning(
+                "resolve_chat_data_source failed for react-agent select_param=%s: %s",
+                dialogue.select_param,
+                e,
+            )
+
     def build_step(title: str, detail: str, phase: str = None):
         nonlocal step
         step += 1
