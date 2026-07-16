@@ -396,6 +396,7 @@ async def test_no_stream_chat_returns_typed_structured_output_failure(monkeypatc
     failed_output = ModelOutput(
         text="Upstream model provider returned invalid structured output.",
         error_code=ErrorCode.VALIDATION_TYPE_ERROR.value,
+        usage={"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
         model_context={
             "upstream_error": {
                 "kind": "structured_output_invalid",
@@ -455,6 +456,12 @@ async def test_no_stream_chat_returns_typed_structured_output_failure(monkeypatc
     assert api_response.status_code == 502
     assert body["error"]["type"] == "structured_output_error"
     assert body["error"]["code"] == "structured_output_invalid"
+    assert body["model"] == "test-model"
+    assert body["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 3,
+        "total_tokens": 14,
+    }
 
 
 @pytest.mark.asyncio

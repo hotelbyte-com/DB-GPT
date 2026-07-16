@@ -63,6 +63,8 @@ class UpstreamProviderErrorResponse(BaseModel):
     """OpenAI-compatible provider error envelope."""
 
     error: UpstreamProviderErrorDetail
+    model: Optional[str] = None
+    usage: Optional[UsageInfo] = None
 
 
 async def check_api_key(
@@ -289,35 +291,27 @@ async def no_stream_wrapper(
         if final_output is None:
             raise RuntimeError("model response did not include a final output")
         if not final_output.success:
-            return _upstream_provider_error_response(final_output)
+            return _upstream_provider_error_response(final_output, request.model)
         if getattr(request, "response_format", None) is not None:
             msg = final_output.text
         else:
             msg = response.replace("\ufffd", "").replace("&quot;", '"')
-        structured_output_error = _validate_structured_output(request, msg)
+        structured_output_error = _validate_structured_output(
+            request, msg, request.model, _usage_info(final_output.usage)
+        )
         if structured_output_error is not None:
             return structured_output_error
         choice_data = ChatCompletionResponseChoice(
             index=0,
             message=ChatMessage(role="assistant", content=msg),
         )
-        raw_usage = final_output.usage or {}
-        prompt_tokens = int(raw_usage.get("prompt_tokens", 0) or 0)
-        completion_tokens = int(raw_usage.get("completion_tokens", 0) or 0)
-        total_tokens = raw_usage.get("total_tokens")
-        if total_tokens is None:
-            total_tokens = prompt_tokens + completion_tokens
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=int(total_tokens or 0),
-        )
+        usage = _usage_info(final_output.usage) or UsageInfo()
         return ChatCompletionResponse(
             id=request.conv_uid, choices=[choice_data], model=request.model, usage=usage
         )
 
 
-def _upstream_provider_error_response(final_output) -> JSONResponse:
+def _upstream_provider_error_response(final_output, model: str) -> JSONResponse:
     provider_error = upstream_provider_error_from_output(final_output)
     if provider_error.kind == "rate_limit":
         status_code = 429
@@ -341,13 +335,18 @@ def _upstream_provider_error_response(final_output) -> JSONResponse:
             type=error_type,
             code=provider_error.kind,
             upstream_status=provider_error.status_code,
-        )
+        ),
+        model=model,
+        usage=_usage_info(final_output.usage),
     )
     return JSONResponse(model_to_dict(body), status_code=status_code)
 
 
 def _validate_structured_output(
-    request: ChatCompletionRequestBody, content: str
+    request: ChatCompletionRequestBody,
+    content: str,
+    model: str,
+    usage: Optional[UsageInfo],
 ) -> Optional[JSONResponse]:
     """Fail closed when a provider violates the requested JSON schema."""
     response_format = getattr(request, "response_format", None)
@@ -363,10 +362,27 @@ def _validate_structured_output(
                 type="structured_output_error",
                 code="structured_output_invalid",
                 upstream_status=None,
-            )
+            ),
+            model=model,
+            usage=usage,
         )
         return JSONResponse(model_to_dict(body), status_code=502)
     return None
+
+
+def _usage_info(raw_usage: Optional[Dict[str, Any]]) -> Optional[UsageInfo]:
+    if not raw_usage:
+        return None
+    prompt_tokens = int(raw_usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(raw_usage.get("completion_tokens", 0) or 0)
+    total_tokens = raw_usage.get("total_tokens")
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+    return UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=int(total_tokens or 0),
+    )
 
 
 _FORBIDDEN_SCHEMA_KEYS = {
