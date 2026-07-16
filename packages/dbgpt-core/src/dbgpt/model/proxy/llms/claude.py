@@ -327,7 +327,14 @@ class ClaudeLLMClient(ProxyLLMClient):
 
 
 def _anthropic_usage(raw_usage: Any) -> Dict[str, int]:
-    prompt_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
+    prompt_tokens = sum(
+        int(getattr(raw_usage, field, 0) or 0)
+        for field in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
     completion_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
     return {
         "prompt_tokens": prompt_tokens,

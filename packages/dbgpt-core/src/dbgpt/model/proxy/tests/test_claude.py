@@ -7,6 +7,7 @@ import pytest
 from dbgpt.core import ModelMessage, ModelRequest
 from dbgpt.model.proxy.llms.claude import (
     ClaudeLLMClient,
+    _anthropic_usage,
     _inline_system_messages,
     _request_stream_enabled,
     _token_count_value,
@@ -30,6 +31,21 @@ def test_token_count_value_accepts_anthropic_sdk_object():
 def test_token_count_value_accepts_legacy_int_and_dict():
     assert _token_count_value(7) == 7
     assert _token_count_value({"input_tokens": 9}) == 9
+
+
+def test_anthropic_usage_includes_cached_input_tokens():
+    usage = SimpleNamespace(
+        input_tokens=0,
+        cache_creation_input_tokens=11,
+        cache_read_input_tokens=29,
+        output_tokens=3,
+    )
+
+    assert _anthropic_usage(usage) == {
+        "prompt_tokens": 40,
+        "completion_tokens": 3,
+        "total_tokens": 43,
+    }
 
 
 def test_inline_system_messages_prefixes_first_user_message():
@@ -128,6 +144,4 @@ class _FakeMessageStream:
 
     async def get_final_message(self):
         self.final_message_requested = True
-        return SimpleNamespace(
-            usage=SimpleNamespace(input_tokens=7, output_tokens=2)
-        )
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=7, output_tokens=2))
