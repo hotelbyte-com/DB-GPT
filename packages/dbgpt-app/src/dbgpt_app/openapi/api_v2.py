@@ -6,6 +6,9 @@ from typing import Any, AsyncIterator, Dict, Literal, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError as JSONSchemaSchemaError
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from starlette.responses import JSONResponse, StreamingResponse
 
 from dbgpt._private.pydantic import BaseModel, model_to_dict, model_to_json
@@ -49,7 +52,9 @@ class UpstreamProviderErrorDetail(BaseModel):
     """Sanitized provider error contract for no-stream callers."""
 
     message: str
-    type: Literal["upstream_provider_error"] = "upstream_provider_error"
+    type: Literal["structured_output_error", "upstream_provider_error"] = (
+        "upstream_provider_error"
+    )
     code: UpstreamErrorKind
     upstream_status: Optional[int]
 
@@ -257,6 +262,7 @@ async def get_chat_instance(
         temperature=dialogue.temperature,
         max_new_tokens=dialogue.max_new_tokens,
         stream=dialogue.stream,
+        response_format=dialogue.response_format,
         chat_mode=ChatScene.of_mode(dialogue.chat_mode),
     )
     chat: BaseChat = await blocking_func_to_async(
@@ -284,7 +290,13 @@ async def no_stream_wrapper(
             raise RuntimeError("model response did not include a final output")
         if not final_output.success:
             return _upstream_provider_error_response(final_output)
-        msg = response.replace("\ufffd", "").replace("&quot;", '"')
+        if getattr(request, "response_format", None) is not None:
+            msg = final_output.text
+        else:
+            msg = response.replace("\ufffd", "").replace("&quot;", '"')
+        structured_output_error = _validate_structured_output(request, msg)
+        if structured_output_error is not None:
+            return structured_output_error
         choice_data = ChatCompletionResponseChoice(
             index=0,
             message=ChatMessage(role="assistant", content=msg),
@@ -310,17 +322,121 @@ def _upstream_provider_error_response(final_output) -> JSONResponse:
     if provider_error.kind == "rate_limit":
         status_code = 429
         message = "Upstream model provider rate limited the request."
+        error_type = "upstream_provider_error"
+    elif provider_error.kind == "structured_output_unsupported":
+        status_code = 422
+        message = "Selected model provider does not support structured output."
+        error_type = "structured_output_error"
+    elif provider_error.kind == "structured_output_invalid":
+        status_code = 502
+        message = "Upstream model provider returned invalid structured output."
+        error_type = "structured_output_error"
     else:
         status_code = 502
         message = "Upstream model provider request failed."
+        error_type = "upstream_provider_error"
     body = UpstreamProviderErrorResponse(
         error=UpstreamProviderErrorDetail(
             message=message,
+            type=error_type,
             code=provider_error.kind,
             upstream_status=provider_error.status_code,
         )
     )
     return JSONResponse(model_to_dict(body), status_code=status_code)
+
+
+def _validate_structured_output(
+    request: ChatCompletionRequestBody, content: str
+) -> Optional[JSONResponse]:
+    """Fail closed when a provider violates the requested JSON schema."""
+    response_format = getattr(request, "response_format", None)
+    if response_format is None:
+        return None
+    try:
+        value = json.loads(content)
+        Draft202012Validator(response_format.json_schema.schema_).validate(value)
+    except (JSONSchemaValidationError, TypeError, json.JSONDecodeError):
+        body = UpstreamProviderErrorResponse(
+            error=UpstreamProviderErrorDetail(
+                message="Upstream model provider returned invalid structured output.",
+                type="structured_output_error",
+                code="structured_output_invalid",
+                upstream_status=None,
+            )
+        )
+        return JSONResponse(model_to_dict(body), status_code=502)
+    return None
+
+
+_FORBIDDEN_SCHEMA_KEYS = {
+    "$anchor",
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$id",
+    "$recursiveRef",
+    "$ref",
+    "$schema",
+    "pattern",
+    "patternProperties",
+}
+_MAX_RESPONSE_SCHEMA_BYTES = 32768
+_MAX_RESPONSE_SCHEMA_DEPTH = 16
+_MAX_RESPONSE_SCHEMA_NODES = 512
+_MAX_RESPONSE_SCHEMA_STRING = 4096
+
+
+def _validate_local_response_schema(schema: Dict[str, Any]) -> None:
+    """Validate a bounded, self-contained schema without network resolution."""
+    if schema.get("type") != "object":
+        raise ValueError("response schema root must be an object")
+    encoded = json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(encoded) > _MAX_RESPONSE_SCHEMA_BYTES:
+        raise ValueError("response schema is too large")
+    nodes = 0
+
+    def walk(value: Any, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _MAX_RESPONSE_SCHEMA_NODES:
+            raise ValueError("response schema has too many nodes")
+        if depth > _MAX_RESPONSE_SCHEMA_DEPTH:
+            raise ValueError("response schema is too deep")
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "properties" and isinstance(child, dict):
+                    for property_name, property_schema in child.items():
+                        if len(property_name) > _MAX_RESPONSE_SCHEMA_STRING:
+                            raise ValueError(
+                                "response schema contains an oversized property name"
+                            )
+                        walk(property_schema, depth + 1)
+                    continue
+                if key in _FORBIDDEN_SCHEMA_KEYS:
+                    raise ValueError(f"response schema keyword {key} is not allowed")
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, depth + 1)
+        elif isinstance(value, str) and len(value) > _MAX_RESPONSE_SCHEMA_STRING:
+            raise ValueError("response schema contains an oversized string")
+
+    walk(schema, 0)
+    Draft202012Validator.check_schema(schema)
+
+
+def _invalid_response_schema() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": "response_format contains an invalid or unsafe JSON schema",
+                "type": "invalid_request_error",
+                "param": "response_format",
+                "code": "invalid_response_format_schema",
+            }
+        },
+    )
 
 
 async def chat_app_stream_wrapper(request: ChatCompletionRequestBody = None):
@@ -448,3 +564,36 @@ def check_chat_request(request: ChatCompletionRequestBody = Body()):
                 }
             },
         )
+    if request.response_format is not None:
+        try:
+            _validate_local_response_schema(request.response_format.json_schema.schema_)
+        except (TypeError, ValueError, JSONSchemaSchemaError) as exc:
+            raise _invalid_response_schema() from exc
+        if request.chat_mode not in (None, ChatScene.ChatNormal.value()):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "response_format is only supported for chat_normal"
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "response_format",
+                        "code": "unsupported_response_format_chat_mode",
+                    }
+                },
+            )
+        if request.stream:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (
+                            "response_format currently requires stream=false"
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "stream",
+                        "code": "unsupported_response_format_stream",
+                    }
+                },
+            )

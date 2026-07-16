@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from concurrent.futures import Executor
@@ -29,7 +30,11 @@ from dbgpt.model.proxy.base import (
     register_proxy_model_adapter,
 )
 from dbgpt.model.proxy.llms.chatgpt import OpenAICompatibleDeployModelParameters
-from dbgpt.model.proxy.llms.provider_error import model_output_from_provider_error
+from dbgpt.model.proxy.llms.provider_error import (
+    StructuredOutputInvalidError,
+    StructuredOutputUnsupportedError,
+    model_output_from_provider_error,
+)
 from dbgpt.model.proxy.llms.proxy_model import ProxyModel, parse_model_request
 from dbgpt.util.i18n_utils import _
 
@@ -78,7 +83,12 @@ async def claude_generate_stream(
 ) -> AsyncIterator[ModelOutput]:
     client: ClaudeLLMClient = cast(ClaudeLLMClient, model.proxy_llm_client)
     stream = _request_stream_enabled(params)
-    request = parse_model_request(params, client.default_model, stream=stream)
+    request = parse_model_request(
+        params,
+        client.default_model,
+        stream=stream,
+        response_format_supported=True,
+    )
     if not stream:
         yield await client.generate(request)
         return
@@ -97,6 +107,8 @@ def _request_stream_enabled(params: Dict[str, Any]) -> bool:
 
 
 class ClaudeLLMClient(ProxyLLMClient):
+    supports_response_format = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -223,6 +235,20 @@ class ClaudeLLMClient(ProxyLLMClient):
             payload["stop"] = request.stop
         if request.top_p:
             payload["top_p"] = request.top_p
+        if request.response_format is not None:
+            json_schema = request.response_format.get("json_schema") or {}
+            schema = json_schema.get("schema")
+            name = json_schema.get("name")
+            if not isinstance(schema, dict) or not isinstance(name, str):
+                raise StructuredOutputUnsupportedError
+            tool = {
+                "name": name,
+                "description": json_schema.get("description")
+                or "Emit the final structured response.",
+                "input_schema": schema,
+            }
+            payload["tools"] = [tool]
+            payload["tool_choice"] = {"type": "tool", "name": name}
         return payload
 
     async def generate(
@@ -255,14 +281,21 @@ class ClaudeLLMClient(ProxyLLMClient):
             response_content = response.content
             if not response_content:
                 raise ValueError("Response content is empty")
+            text = (
+                _structured_response_text(response_content, request.response_format)
+                if request.response_format is not None
+                else response_content[0].text
+            )
             return ModelOutput(
-                text=response_content[0].text,
+                text=text,
                 error_code=0,
                 finish_reason=finish_reason,
                 usage=usage,
             )
         except Exception as e:
-            return model_output_from_provider_error(e)
+            return model_output_from_provider_error(
+                e, structured_output_requested=request.response_format is not None
+            )
 
     async def generate_stream(
         self,
@@ -300,7 +333,9 @@ class ClaudeLLMClient(ProxyLLMClient):
                     usage=_anthropic_usage(final_message.usage),
                 )
         except Exception as e:
-            yield model_output_from_provider_error(e)
+            yield model_output_from_provider_error(
+                e, structured_output_requested=request.response_format is not None
+            )
 
     async def models(self) -> List[ModelMetadata]:
         model_metadata = ModelMetadata(
@@ -336,6 +371,32 @@ def _anthropic_usage(raw_usage: Any) -> Dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+def _structured_response_text(
+    response_content: List[Any], response_format: Dict[str, Any]
+) -> str:
+    """Serialize the forced Anthropic tool input as the assistant JSON response."""
+    json_schema = response_format.get("json_schema") or {}
+    expected_name = json_schema.get("name")
+    for block in response_content:
+        block_type = block.get("type") if isinstance(block, dict) else getattr(
+            block, "type", None
+        )
+        block_name = block.get("name") if isinstance(block, dict) else getattr(
+            block, "name", None
+        )
+        if block_type != "tool_use" or block_name != expected_name:
+            continue
+        value = (
+            block.get("input")
+            if isinstance(block, dict)
+            else getattr(block, "input", None)
+        )
+        if not isinstance(value, dict):
+            break
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    raise StructuredOutputInvalidError
 
 
 def _inline_system_messages(

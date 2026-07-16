@@ -171,7 +171,12 @@ class DeepseekLLMClient(OpenAILLMClient):
         payload = super()._build_request(request, stream)
         model = payload.get("model") or self.default_model
         extra_body = payload.get("extra_body") or {}
-        if "thinking" not in extra_body and self._should_set_thinking(model):
+        if self._thinking_enabled is not None:
+            extra_body["thinking"] = {
+                "type": "enabled" if self._thinking_enabled else "disabled"
+            }
+            payload["extra_body"] = extra_body
+        elif "thinking" not in extra_body and self._should_set_thinking(model):
             thinking_enabled = self._thinking_enabled is True
             extra_body["thinking"] = {
                 "type": "enabled" if thinking_enabled else "disabled"

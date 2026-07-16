@@ -459,6 +459,8 @@ class ModelRequest:
     """The stop condition of the model inference."""
     stop_token_ids: Optional[List[int]] = None
     """The stop token ids of the model inference."""
+    response_format: Optional[Dict[str, Any]] = None
+    """Provider-enforced structured-output response format."""
     context_len: Optional[int] = None
     """The context length of the model inference."""
     echo: Optional[bool] = False

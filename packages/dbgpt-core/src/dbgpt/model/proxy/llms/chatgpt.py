@@ -96,7 +96,12 @@ async def chatgpt_generate_stream(
     model: ProxyModel, tokenizer, params, device, context_len=2048
 ):
     client: OpenAILLMClient = model.proxy_llm_client
-    request = parse_model_request(params, client.default_model, stream=True)
+    request = parse_model_request(
+        params,
+        client.default_model,
+        stream=True,
+        response_format_supported=True,
+    )
     async for r in client.generate_stream(request):
         yield r
 
@@ -132,6 +137,8 @@ async def chatgpt_generate_stream(
     documentation_url="https://github.com/openai/openai-python",
 )
 class OpenAILLMClient(ProxyLLMClient):
+    supports_response_format = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -258,6 +265,8 @@ class OpenAILLMClient(ProxyLLMClient):
             payload["stop"] = request.stop
         if request.top_p:
             payload["top_p"] = request.top_p
+        if request.response_format is not None:
+            payload["response_format"] = request.response_format
         # Disable reasoning/thinking by default. The manufacturing Data Agent
         # interpretation path needs fast, deterministic, non-verbose answers;
         # reasoning models otherwise emit huge thinking blobs (30s+ latency +
@@ -285,7 +294,9 @@ class OpenAILLMClient(ProxyLLMClient):
         try:
             return await self.generate_v1(messages, payload)
         except Exception as e:
-            return model_output_from_provider_error(e)
+            return model_output_from_provider_error(
+                e, structured_output_requested=request.response_format is not None
+            )
 
     async def generate_stream(
         self,

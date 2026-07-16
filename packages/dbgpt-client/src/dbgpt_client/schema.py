@@ -9,12 +9,20 @@ from fastapi import File, UploadFile
 
 from dbgpt._private.pydantic import BaseModel, ConfigDict, Field, model_validator
 from dbgpt.core.awel import CommonLLMHttpRequestBody
-from dbgpt.core.schema.api import APIChatCompletionRequest
+from dbgpt.core.schema.api import APIChatCompletionRequest, JSONSchemaResponseFormat
 from dbgpt_ext.rag.chunk_manager import ChunkParameters
 
 
 class ChatCompletionRequestBody(APIChatCompletionRequest):
     """ChatCompletion LLM http request body."""
+
+    response_format: Optional[JSONSchemaResponseFormat] = Field(
+        default=None,
+        description=(
+            "Optional strict JSON Schema response format. Support is provider "
+            "dependent and unsupported providers fail closed."
+        ),
+    )
 
     max_new_tokens: Optional[int] = Field(
         default=None,

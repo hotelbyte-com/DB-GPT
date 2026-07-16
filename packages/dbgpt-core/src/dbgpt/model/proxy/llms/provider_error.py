@@ -7,7 +7,20 @@ from dbgpt.core import ModelOutput
 from dbgpt.core.schema.api import ErrorCode
 
 UPSTREAM_ERROR_CONTEXT_KEY = "upstream_error"
-UpstreamErrorKind = Literal["rate_limit", "upstream_error"]
+UpstreamErrorKind = Literal[
+    "rate_limit",
+    "structured_output_invalid",
+    "structured_output_unsupported",
+    "upstream_error",
+]
+
+
+class StructuredOutputUnsupportedError(Exception):
+    """The selected provider cannot enforce the requested response schema."""
+
+
+class StructuredOutputInvalidError(Exception):
+    """The provider did not return the required structured response."""
 
 
 @dataclass(frozen=True)
@@ -18,8 +31,34 @@ class UpstreamProviderError:
     status_code: Optional[int]
 
 
-def model_output_from_provider_error(error: Exception) -> ModelOutput:
+def model_output_from_provider_error(
+    error: Exception, structured_output_requested: bool = False
+) -> ModelOutput:
     """Convert an SDK error to a sanitized, typed ``ModelOutput``."""
+    if isinstance(
+        error, (StructuredOutputInvalidError, StructuredOutputUnsupportedError)
+    ):
+        kind: UpstreamErrorKind = (
+            "structured_output_invalid"
+            if isinstance(error, StructuredOutputInvalidError)
+            else "structured_output_unsupported"
+        )
+        provider_error = UpstreamProviderError(kind, None)
+        message = (
+            "Upstream model provider returned invalid structured output."
+            if kind == "structured_output_invalid"
+            else "Selected model provider does not support structured output."
+        )
+        return ModelOutput(
+            text=message,
+            error_code=ErrorCode.VALIDATION_TYPE_ERROR.value,
+            model_context={
+                UPSTREAM_ERROR_CONTEXT_KEY: {
+                    "kind": provider_error.kind,
+                    "status_code": provider_error.status_code,
+                }
+            },
+        )
     status_code = _provider_status_code(error)
     if status_code == 429:
         provider_error = UpstreamProviderError("rate_limit", status_code)
@@ -50,7 +89,12 @@ def upstream_provider_error_from_output(
     if isinstance(raw_error, dict):
         raw_kind = raw_error.get("kind")
         raw_status = raw_error.get("status_code")
-        if raw_kind in ("rate_limit", "upstream_error"):
+        if raw_kind in (
+            "rate_limit",
+            "structured_output_invalid",
+            "structured_output_unsupported",
+            "upstream_error",
+        ):
             status_code = _valid_http_status(raw_status)
             return UpstreamProviderError(raw_kind, status_code)
     if output.error_code == ErrorCode.RATE_LIMIT.value:

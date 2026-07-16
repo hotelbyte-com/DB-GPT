@@ -24,6 +24,7 @@ from dbgpt.core.interface.message import (
     ModelMessage,
     StorageConversation,
 )
+from dbgpt.core.schema.api import JSONSchemaResponseFormat
 from dbgpt.core.schema.types import (
     ChatCompletionUserMessageParam,
 )
@@ -66,6 +67,7 @@ class ChatParam:
     temperature: Optional[float] = field(default=None)
     max_new_tokens: Optional[int] = field(default=None)
     stream: Optional[bool] = field(default=None)
+    response_format: Optional[JSONSchemaResponseFormat] = field(default=None)
     message_version: str = "v2"
     model_cache_enable: bool = False
     prompt_code: Optional[str] = None
@@ -89,6 +91,12 @@ class ChatParam:
         if self.stream is None:
             return template_default
         return self.stream
+
+    def provider_response_format(self) -> Optional[Dict[str, Any]]:
+        """Return the validated provider response format, if requested."""
+        if self.response_format is None:
+            return None
+        return self.response_format.to_provider_dict()
 
 
 def _build_conversation(
@@ -390,6 +398,7 @@ class BaseChat(ABC):
             messages=self.history_messages, prompt_dict=input_values
         )
         model_request: ModelRequest = await node.call(call_data=node_input)
+        model_request.response_format = self._chat_param.provider_response_format()
         model_request.context.cache_enable = self.model_cache_enable
         if model_request.messages:
             for msg in model_request.messages:
