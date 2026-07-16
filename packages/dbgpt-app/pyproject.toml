@@ -11,14 +11,15 @@ requires-python = ">= 3.10"
 
 dependencies = [
     "dbgpt-acc-auto",
-    "dbgpt[client,cli,agent,simple_framework,framework,code,proxy_openai,proxy_tongyi,proxy_zhipuai]",
-    "dbgpt-ext[rag,storage_chromadb]",
+    "dbgpt[client,cli,agent,simple_framework,framework,code,proxy_openai,proxy_anthropic,proxy_tongyi,proxy_zhipuai]",
+    "dbgpt-ext[rag,storage_chromadb,datasource_redis,datasource_mongo,embedding_ollama,file_minio]",
     "dbgpt-serve",
     "dbgpt-client",
     "dbgpt-sandbox",
     "aiofiles",
     "httpx>=0.24.0",
     "pyparsing",
+    "sqlglot==26.13.2",
 ]
 
 [project.urls]
@@ -83,4 +84,3 @@ exclude = [
 "../../pilot/examples/Walmart_Sales.db" = "pilot_tpl/examples/Walmart_Sales.db"
 
 [tool.hatch.build.hooks.custom]
-

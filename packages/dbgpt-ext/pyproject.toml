@@ -70,6 +70,9 @@ datasource_duckdb = [
     "duckdb",
     "duckdb-engine==0.9.1",
 ]
+datasource_redis = ["redis==8.0.0"]
+datasource_mongo = ["pymongo==4.17.0"]
+embedding_ollama = ["ollama==0.6.2"]
 # datasource_doris = ["pydoris>=1.0.2,<2.0.0"]
 storage_milvus = ["pymilvus"]
 storage_weaviate = ["weaviate-client"]
@@ -85,6 +88,7 @@ storage_valkey = ["valkey-glide>=2.3.0"]
 file_oss = [
     "oss2" # Aliyun OSS
 ]
+file_minio = ["minio==7.2.20"]
 file_s3 = [
     "boto3"
 ]

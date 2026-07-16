@@ -175,3 +175,15 @@ def test_get_list_page_user(db: DatabaseManager, User: Type[BaseModel], user_dao
     assert page_result.total_pages == 4
     assert len(page_result.items) == 3
     assert page_result.items[0].name == "User 6"
+
+
+def test_default_sqlite_file_db_enables_wal_and_busy_timeout(tmp_path):
+    db = DatabaseManager()
+    db.init_default_db(str(tmp_path / "metadata.db"))
+
+    with db.engine.connect() as conn:
+        journal_mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+        busy_timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar()
+
+    assert str(journal_mode).lower() == "wal"
+    assert int(busy_timeout) >= 30000

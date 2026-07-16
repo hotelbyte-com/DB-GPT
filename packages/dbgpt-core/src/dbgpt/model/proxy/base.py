@@ -184,6 +184,7 @@ class ProxyLLMClient(LLMClient):
 
     executor: Executor
     model_names: List[str]
+    supports_response_format: bool = False
 
     def __init__(
         self,

@@ -5,11 +5,56 @@ import uuid
 from enum import IntEnum
 from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar, Union
 
-from dbgpt._private.pydantic import BaseModel, Field, model_to_dict
+from dbgpt._private.pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_to_dict,
+)
 
 from .types import ChatCompletionMessageParam
 
 T = TypeVar("T")
+
+
+class JSONSchemaDefinition(BaseModel):
+    """Named JSON Schema sent to a structured-output model provider."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="Provider-visible schema name.",
+    )
+    description: Optional[str] = Field(
+        default=None, description="Optional provider-visible schema description."
+    )
+    strict: bool = Field(
+        default=True, description="Require the provider to enforce the JSON Schema."
+    )
+    schema_: Dict[str, Any] = Field(
+        ...,
+        alias="schema",
+        serialization_alias="schema",
+        description="JSON Schema describing the assistant response.",
+    )
+
+class JSONSchemaResponseFormat(BaseModel):
+    """OpenAI-compatible strict JSON Schema response format."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_schema"] = Field(
+        default="json_schema", description="Structured-output response format type."
+    )
+    json_schema: JSONSchemaDefinition
+
+    def to_provider_dict(self) -> Dict[str, Any]:
+        """Return the exact OpenAI-compatible provider request shape."""
+        return model_to_dict(self, by_alias=True, exclude_none=True)
 
 
 class Result(BaseModel, Generic[T]):
@@ -73,7 +118,6 @@ class APIChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = Field(1.0, description="Repetition penalty")
     frequency_penalty: Optional[float] = Field(0.0, description="Frequency penalty")
     presence_penalty: Optional[float] = Field(0.0, description="Presence penalty")
-
     def single_prompt(self) -> str:
         """Get single prompt from messages."""
         if isinstance(self.messages, str):

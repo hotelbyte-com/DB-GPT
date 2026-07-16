@@ -5,6 +5,7 @@ import cachetools
 
 from dbgpt.core import ModelRequest, ModelRequestContext
 from dbgpt.model.base import SupportedModel
+from dbgpt.model.proxy.llms.provider_error import StructuredOutputUnsupportedError
 from dbgpt.util.annotations import Deprecated
 from dbgpt.util.parameter_utils import _get_parameter_descriptions
 
@@ -78,7 +79,10 @@ def _list_supported_models(
 
 
 def parse_model_request(
-    params: Dict[str, Any], default_model: str, stream: bool = True
+    params: Dict[str, Any],
+    default_model: str,
+    stream: bool = True,
+    response_format_supported: bool = False,
 ) -> ModelRequest:
     """Parse model request from params.
 
@@ -86,7 +90,13 @@ def parse_model_request(
         params (Dict[str, Any]): request params
         default_model (str): default model name
         stream (bool, optional): whether stream. Defaults to True.
+        response_format_supported(bool, optional): whether the provider can enforce
+            a structured response format. Defaults to False.
     """
+    response_format = params.get("response_format")
+    if response_format is not None and not response_format_supported:
+        raise StructuredOutputUnsupportedError
+
     context = ModelRequestContext(
         stream=stream,
         user_name=params.get("user_name"),
@@ -101,5 +111,6 @@ def parse_model_request(
         max_new_tokens=params.get("max_new_tokens"),
         stop=params.get("stop"),
         top_p=params.get("top_p"),
+        response_format=response_format,
     )
     return request

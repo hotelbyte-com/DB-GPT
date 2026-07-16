@@ -1,10 +1,10 @@
 [system]
 language = "${env:DBGPT_LANG:-en}"
 api_keys = []
-encrypt_key = "your_secret_key"
+encrypt_key = "${env:DBGPT_ENCRYPT_KEY}"
 
 [service.web]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 5670
 
 [service.web.database]
@@ -24,35 +24,56 @@ persist_path = "pilot/data"
 name = "${env:LLM_MODEL_NAME:-MiniMax-M2.7}"
 provider = "proxy/openai"
 api_base = "https://api.minimax.io/v1"
-api_key = "sk-cp-0_0ttCtA8Cji9XcP1LT4r-5y-3ri9jpfsX-7U2S2VMqNj8CmJ-ZHeI8kEvAgi4-vCAiOig8udwJxS2eU9_BzcJmPUrhooEyWiUt6XfjP_K84uGAGXoj_HRc"
+api_key = "${env:MINIMAX_API_KEY}"
 
 # ── kimi-for-coding (本地代理) ──
 [[models.llms]]
 name = "kimi-for-coding"
 provider = "proxy/openai"
 api_base = "http://kimi.hotelbyte.com:3000/v1"
-api_key = "sk-kimi-nBxlKgUbdIbyUwnaUcL3urlkNQ1Le4fS7rZr6vun5igHIipwqf80nJDK4fvMJHqN"
+api_key = "${env:KIMI_API_KEY}"
 
 # ── glm-4.7 (z.ai coding plan) ──
 [[models.llms]]
 name = "glm-4.7"
 provider = "proxy/openai"
 api_base = "https://api.z.ai/api/coding/paas/v4/"
-api_key = "63d4b6a542c7422b97d56a0c98b99d2a.UIWMIEpwYCuL5SY4"
+api_key = "${env:ZAI_API_KEY}"
 
 # ── deepseek-v4-flash (fast, cheap) ──
 [[models.llms]]
 name = "deepseek-v4-flash"
 provider = "proxy/deepseek"
 api_base = "https://api.deepseek.com/v1"
-api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
+api_key = "${env:DEEPSEEK_API_KEY}"
 
 # ── deepseek-v4-pro (stronger reasoning) ──
 [[models.llms]]
 name = "deepseek-v4-pro"
 provider = "proxy/deepseek"
 api_base = "https://api.deepseek.com/v1"
-api_key = "sk-514d1c82d324466fa4bf8cb81782e2c1"
+api_key = "${env:DEEPSEEK_API_KEY}"
+
+# Manufacturing runtime aliases. These names are part of the Go-side typed
+# routing contract; credentials remain owned by the deployed environment.
+[[models.llms]]
+name = "MiniMax-M3"
+provider = "proxy/claude"
+api_base = "https://api.minimax.io/anthropic"
+api_key = "${env:MINIMAX_M3_API_KEY}"
+
+[[models.llms]]
+name = "kimi2.7"
+provider = "proxy/claude"
+api_base = "https://api.kimi.com/coding/"
+api_key = "${env:KIMI27_API_KEY}"
+
+[[models.llms]]
+name = "glm5.2"
+provider = "proxy/claude"
+api_base = "https://api.z.ai/api/anthropic"
+api_key = "${env:ZAI_ANTHROPIC_API_KEY}"
+backend = "glm-5.2"
 
 # Embedding: Ollama local (nomic-embed-text, 768-dim)
 [[models.embeddings]]

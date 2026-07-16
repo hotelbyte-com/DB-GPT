@@ -67,6 +67,7 @@ def test_allowed_tables_hint_routes_to_tdengine(mock_metadata):
             _ds("hblog_ns", "tdengine", "operational logs"),
         ]
     )
+
     # Metadata scoring still runs; make MySQL look textually closer to the
     # question so only the contract hint can flip the winner.
     def metadata_side_effect(candidate, _dao):
@@ -101,7 +102,10 @@ def test_resolve_passes_hints_through(mock_resolve, mock_choose):
     mock_resolve.return_value = ["hotel_user", "hblog_ns"]
     mock_choose.return_value = "hblog_ns"
     got = resolve_chat_data_source(
-        "hotel-be", "some question", system_app=object(), hints={"allowed_tables": ["hb_log"]}
+        "hotel-be",
+        "some question",
+        system_app=object(),
+        hints={"allowed_tables": ["hb_log"]},
     )
     assert got == "hblog_ns"
     # hints is the 5th positional argument to _choose_candidate

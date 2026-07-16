@@ -18,6 +18,7 @@ from dbgpt.model.proxy.base import (
     ProxyLLMClient,
     register_proxy_model_adapter,
 )
+from dbgpt.model.proxy.llms.provider_error import model_output_from_provider_error
 from dbgpt.model.proxy.llms.proxy_model import ProxyModel, parse_model_request
 from dbgpt.model.utils.chatgpt_utils import OpenAIParameters
 from dbgpt.util.i18n_utils import _
@@ -95,7 +96,12 @@ async def chatgpt_generate_stream(
     model: ProxyModel, tokenizer, params, device, context_len=2048
 ):
     client: OpenAILLMClient = model.proxy_llm_client
-    request = parse_model_request(params, client.default_model, stream=True)
+    request = parse_model_request(
+        params,
+        client.default_model,
+        stream=True,
+        response_format_supported=True,
+    )
     async for r in client.generate_stream(request):
         yield r
 
@@ -131,6 +137,8 @@ async def chatgpt_generate_stream(
     documentation_url="https://github.com/openai/openai-python",
 )
 class OpenAILLMClient(ProxyLLMClient):
+    supports_response_format = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -257,6 +265,19 @@ class OpenAILLMClient(ProxyLLMClient):
             payload["stop"] = request.stop
         if request.top_p:
             payload["top_p"] = request.top_p
+        if request.response_format is not None:
+            payload["response_format"] = request.response_format
+        # Disable reasoning/thinking by default. The manufacturing Data Agent
+        # interpretation path needs fast, deterministic, non-verbose answers;
+        # reasoning models otherwise emit huge thinking blobs (30s+ latency +
+        # multi-thousand-token outputs that destabilize the worker). z.ai honors
+        # {"thinking":{"type":"disabled"}} (~3s, clean output); other
+        # OpenAI-compatible providers ignore the unknown field.
+        # Callers can still override via an explicit extra_body.thinking.
+        extra_body = dict(payload.get("extra_body") or {})
+        if "thinking" not in extra_body:
+            extra_body["thinking"] = {"type": "disabled"}
+        payload["extra_body"] = extra_body
         return payload
 
     async def generate(
@@ -273,9 +294,8 @@ class OpenAILLMClient(ProxyLLMClient):
         try:
             return await self.generate_v1(messages, payload)
         except Exception as e:
-            return ModelOutput(
-                text=f"**LLMServer Generate Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
+            return model_output_from_provider_error(
+                e, structured_output_requested=request.response_format is not None
             )
 
     async def generate_stream(

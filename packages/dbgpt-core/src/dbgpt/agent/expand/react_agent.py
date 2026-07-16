@@ -45,7 +45,7 @@ IMPORTANT:
 Thought: ...
 Phase: 返回最终结果
 Action: terminate
-Action Input: {"result": "final answer"}
+Action Input: {"output": "final answer"}
 - Do not put the final answer as plain markdown outside Action Input.
 
 For each task input, your response should contain:
@@ -243,34 +243,28 @@ class ReActAgent(ConversableAgent):
             raise ValueError("The response is empty.")
         try:
             steps = self.parser.parse_current_step(message_content)
-            err_msg = None
-            if not steps:
-                # Fallback: if model gave a direct answer without ReAct format,
-                # treat it as a terminate action so the answer isn't lost.
-                if len(message_content.strip()) > 50:
-                    logger.warning(
-                        "ReAct parse failed, but model provided a substantive "
-                        "response. Treating as direct terminate."
-                    )
-                    from dbgpt.agent.expand.actions.react_action import Terminate
-                    return ActionOutput(
-                        is_exe_success=True,
-                        content=message_content,
-                        have_retry=False,
-                        action=Terminate(),
-                        observations=message_content,
-                        terminate=True,
-                    )
-                err_msg = (
+        except Exception as e:
+            logger.warning("ReAct response parsing failed: %s", e)
+            return ActionOutput(
+                is_exe_success=False,
+                content="Unable to parse the required ReAct response format.",
+                terminate=False,
+            )
+        if not steps:
+            return ActionOutput(
+                is_exe_success=False,
+                content=(
                     "No correct response found. Please check your response, which must"
                     " be in the format indicated in the system prompt."
-                )
-            elif len(steps) != 1:
-                err_msg = "Only one action is allowed each time."
-            if err_msg:
-                return ActionOutput(is_exe_success=False, content=err_msg)
-        except Exception as e:
-            logger.warning(f"review error: {e}")
+                ),
+                terminate=False,
+            )
+        if len(steps) != 1:
+            return ActionOutput(
+                is_exe_success=False,
+                content="Only one action is allowed each time.",
+                terminate=False,
+            )
 
         action_output = await super().act(
             message=message,

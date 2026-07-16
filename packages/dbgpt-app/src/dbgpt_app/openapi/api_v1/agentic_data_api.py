@@ -23,9 +23,20 @@ from dbgpt.component import ComponentType
 from dbgpt.configs.model_config import SKILLS_DIR, resolve_root_path
 from dbgpt.core import PromptTemplate
 from dbgpt.model.cluster import WorkerManagerFactory
+from dbgpt_app.openapi.api_v1.react_agent_sse import (
+    REACT_AGENT_ERROR_MESSAGES,
+    classify_react_agent_error,
+    close_terminate_step,
+    emit_react_agent_event,
+    terminal_error_events,
+)
 from dbgpt_app.openapi.api_view_model import (
     ConversationVo,
     Result,
+)
+from dbgpt_app.scene.chat_db.manufacturing_mongo_stream import (
+    is_manufacturing_mongo_source,
+    stream_manufacturing_mongo_query,
 )
 from dbgpt_serve.datasource.manages import ConnectorManager
 from dbgpt_serve.utils.auth import UserRequest, get_user_from_headers
@@ -194,6 +205,113 @@ def _parse_connector_ids(ext_info: Optional[Dict[str, Any]]) -> List[str]:
     if isinstance(legacy, str) and legacy:
         return [legacy]
     return []
+
+
+def _is_hotel_be_data_agent_source(ext_info: Optional[Dict[str, Any]]) -> bool:
+    """Return True for hotel-be's governed Data Agent ReAct stream."""
+    if not ext_info or not isinstance(ext_info, dict):
+        return False
+    return str(ext_info.get("source") or "").strip() == "hotel-be-data-agent"
+
+
+def _normalize_sql_display_type(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = normalized.removeprefix("response_")
+    aliases = {
+        "": "response_table",
+        "table": "response_table",
+        "data_table": "response_table",
+        "line": "response_line_chart",
+        "line_chart": "response_line_chart",
+        "trend": "response_line_chart",
+        "bar": "response_bar_chart",
+        "bar_chart": "response_bar_chart",
+        "column": "response_bar_chart",
+        "column_chart": "response_bar_chart",
+        "area": "response_area_chart",
+        "area_chart": "response_area_chart",
+        "pie": "response_pie_chart",
+        "pie_chart": "response_pie_chart",
+        "scatter": "response_scatter",
+        "scatter_chart": "response_scatter",
+    }
+    return aliases.get(normalized, f"response_{normalized}")
+
+
+def _default_sql_artifact_title(display_type: str) -> str:
+    if display_type == "response_table":
+        return "SQL query result"
+    if display_type == "response_line_chart":
+        return "SQL trend chart"
+    if display_type == "response_bar_chart":
+        return "SQL breakdown chart"
+    return "SQL visualization"
+
+
+def _validate_hotel_be_sql_query(sql: str) -> Optional[str]:
+    sql_stripped = str(sql or "").strip().rstrip(";")
+    sql_upper = sql_stripped.upper().lstrip()
+    if not sql_upper.startswith("SELECT"):
+        return "安全限制: 仅支持 SELECT 查询。"
+    if ";" in sql_stripped:
+        return "SQL治理: 仅支持单条 SELECT 查询，不允许多语句执行。"
+
+    # Low-level SQL governance for the hotel-be data-agent datasource boundary.
+    # This is intentionally protocol parsing, not agent routing logic.
+    forbidden_match = re.search(
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|MERGE|CALL|EXEC|REPLACE|LOAD|COPY)\b",
+        sql_stripped,
+        re.I,
+    )
+    if forbidden_match:
+        return f"安全限制: 不允许执行 {forbidden_match.group(1).upper()} 语句。"
+
+    limit_matches = list(
+        re.finditer(r"\blimit\s+(\d+)(?:\s*,\s*(\d+))?\b", sql_stripped, re.I)
+    )
+    if not limit_matches:
+        return "SQL治理: 必须包含 LIMIT，且 LIMIT 不能超过 100。"
+    max_limit = max(int(match.group(2) or match.group(1)) for match in limit_matches)
+    if max_limit > 100:
+        return (
+            f"SQL治理: LIMIT {max_limit} 超过上限 100，请改为 LIMIT 100 或更小后重试。"
+        )
+    return None
+
+
+def _extract_hotel_be_user_question(user_input: str) -> str:
+    text = str(user_input or "").strip()
+    if not text:
+        return ""
+
+    markers = [
+        "\n用户问题:\n",
+        "\n用户问题：\n",
+        "\nUser question:\n",
+        "\nQuestion:\n",
+        "用户问题:",
+        "用户问题：",
+        "User question:",
+        "Question:",
+    ]
+    best_index = -1
+    best_marker = ""
+    for marker in markers:
+        index = text.rfind(marker)
+        if index > best_index:
+            best_index = index
+            best_marker = marker
+    if best_index >= 0:
+        question = text[best_index + len(best_marker) :].strip()
+        if question:
+            return question
+
+    separator = "\n---\n"
+    if separator in text:
+        question = text.rsplit(separator, 1)[1].strip()
+        if question:
+            return question
+    return text
 
 
 def _select_connector_tools(
@@ -981,7 +1099,7 @@ async def skill_import_from_github_v2(
 
 
 def _sse_event(payload: Dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return emit_react_agent_event(payload)
 
 
 def _optional_str(value: Any) -> Optional[str]:
@@ -1035,7 +1153,119 @@ def _react_agent_database_name(
     return select_param
 
 
+def _react_agent_contract_resolution(
+    dialogue: ConversationVo,
+    user_input: str,
+    resolver: Optional[Any] = None,
+) -> Tuple[Optional[Any], Optional[Any]]:
+    """Parse and resolve a typed data-query contract.
+
+    A declared contract makes the logical group authoritative. Physical source
+    overrides from the caller are rejected because DB-GPT owns registration,
+    credentials, source selection, and execution evidence.
+    """
+
+    from dbgpt_app.scene.chat_db.query_contract import parse_data_query_contract
+
+    contract = parse_data_query_contract(dialogue.ext_info)
+    if contract is None:
+        return None, None
+    if dialogue.ext_info and _optional_str(dialogue.ext_info.get("database_name")):
+        raise ValueError("physical_datasource_override_forbidden")
+    select_param = _optional_str(dialogue.select_param) or contract.logical_group
+    if resolver is None:
+        from dbgpt_app.scene.chat_db.datasource_router import (
+            resolve_chat_data_source_with_evidence,
+        )
+
+        resolver = resolve_chat_data_source_with_evidence
+    resolution = resolver(
+        select_param,
+        user_input,
+        CFG.SYSTEM_APP,
+        contract=contract,
+    )
+    return contract, resolution
+
+
+def _extract_terminate_output(raw_content: str, parser: Any) -> str:
+    """Extract canonical Terminate.output with a bounded legacy fallback."""
+
+    final_content = raw_content
+    try:
+        steps = parser.parse(raw_content)
+        if not steps or not steps[0].action_input:
+            return final_content
+        action_input = steps[0].action_input
+        parsed_input = (
+            json.loads(action_input) if isinstance(action_input, str) else action_input
+        )
+        if not isinstance(parsed_input, dict):
+            return final_content
+        if "output" in parsed_input:
+            return str(parsed_input["output"])
+        if "result" in parsed_input:
+            return str(parsed_input["result"])
+    except Exception:
+        return final_content
+    return final_content
+
+
+def _typed_tool_gap(kind: str, reason: str, evidence: Any = None) -> str:
+    gap: Dict[str, Any] = {"kind": kind, "reason": reason}
+    if evidence is not None:
+        gap["evidence"] = (
+            evidence.model_dump() if hasattr(evidence, "model_dump") else evidence
+        )
+    return json.dumps(
+        {
+            "chunks": [
+                {
+                    "output_type": "text",
+                    "content": f"Data query gap [{kind}]: {reason}",
+                }
+            ],
+            "gap": gap,
+        },
+        default=str,
+        ensure_ascii=False,
+    )
+
+
+def _declares_governed_query_contract(dialogue: ConversationVo) -> bool:
+    return bool(
+        _is_hotel_be_data_agent_source(dialogue.ext_info)
+        and isinstance(dialogue.ext_info, dict)
+        and "query_contract" in dialogue.ext_info
+    )
+
+
 async def _react_agent_stream(
+    dialogue: ConversationVo,
+) -> AsyncGenerator[str, None]:
+    """Route declared typed contracts away from the probabilistic ReAct loop."""
+
+    if is_manufacturing_mongo_source(dialogue):
+        async for event in stream_manufacturing_mongo_query(dialogue):
+            yield event
+        return
+    if _declares_governed_query_contract(dialogue):
+        from dbgpt_app.scene.chat_db.governed_query_stream import (
+            stream_governed_query_contract,
+        )
+
+        async for event in stream_governed_query_contract(
+            dialogue,
+            system_app=CFG.SYSTEM_APP,
+            contract_resolver=_react_agent_contract_resolution,
+        ):
+            yield event
+        return
+    async for event in _general_react_agent_stream(dialogue):
+        yield event
+
+
+async def _general_react_agent_stream(
     dialogue: ConversationVo,
 ) -> AsyncGenerator[str, None]:
     import asyncio
@@ -1077,20 +1307,45 @@ async def _react_agent_stream(
             or dialogue.ext_info.get("knowledge_space_name")
             or dialogue.ext_info.get("knowledge_space_id")
         )
-    database_name = _react_agent_database_name(dialogue, user_input)
+    is_hotel_be_data_agent = _is_hotel_be_data_agent_source(dialogue.ext_info)
+    if is_hotel_be_data_agent:
+        user_input = _extract_hotel_be_user_question(user_input)
+    query_contract = None
+    source_resolution = None
+    contract_resolution_error = ""
+    if is_hotel_be_data_agent:
+        try:
+            query_contract, source_resolution = _react_agent_contract_resolution(
+                dialogue, user_input
+            )
+        except Exception as exc:
+            contract_resolution_error = type(exc).__name__
+            logger.warning(
+                "HotelByte data-query contract resolution failed: %s",
+                contract_resolution_error,
+                exc_info=exc,
+            )
+    if query_contract is not None:
+        if source_resolution is not None and source_resolution.status == "selected":
+            database_name = source_resolution.selected
+        else:
+            database_name = None
+    elif not contract_resolution_error:
+        database_name = _react_agent_database_name(dialogue, user_input)
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
 
-    # Resolve a concrete datasource when the caller did not pin one explicitly.
-    # hotel-be sends select_param="hotel-be" (a logical group) plus, when a
-    # query_contract applies, an allowed_tables hint in ext_info. Without this
-    # resolution the ReAct agent has no datasource at all and sql_query either
-    # fails with "未选择数据库" or falls back to the wrong MySQL default — which
-    # is the root cause of "/agents 页面 sql 失败". We reuse the same router
-    # chat_data uses so TDengine (hblog_ns) becomes reachable for time-series
-    # questions instead of being excluded from the hotel-be group.
-    if not database_name and dialogue.select_param:
+    # Legacy requests without a governed query contract still need their logical
+    # group resolved to a physical datasource. Declared contracts are routed by
+    # _react_agent_stream before this general ReAct path and must never fall back
+    # to best-effort question scoring after a typed resolution failure.
+    if (
+        not database_name
+        and dialogue.select_param
+        and query_contract is None
+        and not contract_resolution_error
+    ):
         try:
             from dbgpt_app.scene.chat_db.datasource_router import (
                 resolve_chat_data_source,
@@ -1125,7 +1380,14 @@ async def _react_agent_stream(
         return step_id, _sse_event(event_data)
 
     def step_output(detail: str):
-        return _sse_event({"type": "step.output", "step": step, "detail": detail})
+        return _sse_event(
+            {
+                "type": "step.output",
+                "step": step,
+                "id": f"step-{step}",
+                "detail": detail,
+            }
+        )
 
     def step_chunk(step_id: str, output_type: str, content: Any):
         return _sse_event(
@@ -1295,14 +1557,15 @@ async def _react_agent_stream(
     # Step 2: Get business tools from ResourceManager
     rm = get_resource_manager(CFG.SYSTEM_APP)
     business_tools: List[Any] = []
-    try:
-        # Get all registered tool resources from ResourceManager
-        tool_resources = rm._type_to_resources.get("tool", [])
-        for reg_resource in tool_resources:
-            if reg_resource.resource_instance is not None:
-                business_tools.append(reg_resource.resource_instance)
-    except Exception:
-        pass  # If no business tools, continue with empty list
+    if not is_hotel_be_data_agent:
+        try:
+            # Get all registered tool resources from ResourceManager
+            tool_resources = rm._type_to_resources.get("tool", [])
+            for reg_resource in tool_resources:
+                if reg_resource.resource_instance is not None:
+                    business_tools.append(reg_resource.resource_instance)
+        except Exception:
+            pass  # If no business tools, continue with empty list
 
     # Step 2.5: Generate business tool descriptions for prompt injection
     business_tool_descriptions = ""
@@ -1316,8 +1579,15 @@ async def _react_agent_stream(
                 arg_parts = []
                 for pname, pobj in ft.args.items():
                     req = "required" if pobj.required else "optional"
-                    default_str = f", default={pobj.default}" if pobj.default is not None and str(pobj.default) != "_MISSING" else ""
-                    arg_parts.append(f"{pname}: {pobj.type} ({req}{default_str}) — {pobj.description}")
+                    default_str = (
+                        f", default={pobj.default}"
+                        if pobj.default is not None and str(pobj.default) != "_MISSING"
+                        else ""
+                    )
+                    arg_parts.append(
+                        f"{pname}: {pobj.type} ({req}{default_str}) — "
+                        f"{pobj.description}"
+                    )
                 args_str = "\n    " + "\n    ".join(arg_parts) if arg_parts else ""
                 desc_lines.append(f"- **{name}**: {doc.strip()}{args_str}")
             else:
@@ -1325,8 +1595,15 @@ async def _react_agent_stream(
                 doc = getattr(bt, "__doc__", "") or ""
                 if hasattr(bt, "_description") and bt._description:
                     doc = bt._description
-                desc_lines.append(f"- **{name}**: {doc.strip()}" if doc.strip() else f"- **{name}**")
-        business_tool_descriptions = "\n## Registered Business Tools\nThese tools are always available. Use them FIRST when relevant.\n\nYou MUST use these exact parameter names when calling the tools. Do NOT guess or invent parameter names.\n" + "\n".join(desc_lines)
+                desc_lines.append(
+                    f"- **{name}**: {doc.strip()}" if doc.strip() else f"- **{name}**"
+                )
+        business_tool_descriptions = (
+            "\n## Registered Business Tools\n"
+            "These tools are always available. Use them FIRST when relevant.\n\n"
+            "You MUST use these exact parameter names when calling the tools. "
+            "Do NOT guess or invent parameter names.\n" + "\n".join(desc_lines)
+        )
 
     # Step 3: Load knowledge space resource if specified in ext_info
     knowledge_resources: List[Any] = []
@@ -1364,12 +1641,17 @@ async def _react_agent_stream(
     # Step 4: Load database connector if specified in ext_info
     database_connector = None
     database_context = ""
+    selected_schema_tables: List[str] = []
+    schema_context_status = "not_loaded"
+    schema_context_error = ""
     if database_name:
         try:
             local_db_manager = ConnectorManager.get_instance(CFG.SYSTEM_APP)
             database_connector = local_db_manager.get_connector(database_name)
             table_names = list(database_connector.get_table_names())
+            selected_schema_tables = sorted(str(name) for name in table_names)
             table_info = database_connector.get_table_info_no_throw()
+            schema_context_status = "loaded"
             database_context = f"""
 ## 数据库信息
 - 数据库名: {database_name}
@@ -1379,15 +1661,37 @@ async def _react_agent_stream(
 - 使用 'sql_query' 工具执行 SQL 查询
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
 """
+            if query_contract is not None:
+                database_context += """
+- 受控查询只能使用上方列出的未限定表名；禁止 `database.table` 跨库限定。
+"""
             logger.info(
                 f"Loaded database connector: {database_name} "
                 f"(tables: {', '.join(table_names)})"
             )
         except Exception as e:
             logger.warning(f"Failed to load database connector: {e}", exc_info=e)
+            # Never retain a connector whose schema bootstrap failed. Executing
+            # through it would turn a source failure into cross-source guesses.
+            database_connector = None
+            schema_context_status = "unavailable"
+            schema_context_error = type(e).__name__
             database_context = f"""
 ## 数据库
-- 警告: 加载数据库 '{database_name}' 失败。错误: {str(e)}
+- 警告: 加载数据库 '{database_name}' 失败。错误类型: {type(e).__name__}
+"""
+    elif source_resolution is not None:
+        schema_context_status = "source_unavailable"
+        database_context = f"""
+## 数据源缺口
+{json.dumps(source_resolution.model_dump(), ensure_ascii=False)}
+"""
+    elif contract_resolution_error:
+        schema_context_status = "contract_invalid"
+        database_context = f"""
+## 数据查询契约缺口
+- status: contract_invalid
+- error_type: {contract_resolution_error}
 """
 
     react_state: Dict[str, Any] = {
@@ -1395,6 +1699,17 @@ async def _react_agent_stream(
         "matched": None,
         "skill_prompt": None,
         "file_path": file_path,
+        "query_contract": (
+            query_contract.model_dump() if query_contract is not None else None
+        ),
+        "source_resolution": (
+            source_resolution.model_dump() if source_resolution is not None else None
+        ),
+        "schema_context": {
+            "status": schema_context_status,
+            "tables": selected_schema_tables,
+            "error_type": schema_context_error,
+        },
     }
 
     # Pre-select skill if skill_name provided in ext_info
@@ -1914,12 +2229,33 @@ print(json.dumps(summary, ensure_ascii=False))
     @tool(
         description=(
             "对用户选择的数据库执行 SQL 查询（仅支持 SELECT）。"
-            '参数: {"sql": "SELECT 语句"}'
+            '参数: {"sql": "SELECT 语句", '
+            '"display_type": "response_table|response_line_chart|response_bar_chart", '
+            '"title": "图表或表格标题"}'
         )
     )
-    def sql_query(sql: str) -> str:
+    def sql_query(
+        sql: str, display_type: str = "response_table", title: str = ""
+    ) -> str:
         """Execute a read-only SQL query against the selected database."""
         if database_connector is None:
+            if query_contract is not None or contract_resolution_error:
+                evidence = (
+                    source_resolution
+                    if source_resolution is not None
+                    else {
+                        "logical_group": getattr(
+                            query_contract, "logical_group", dialogue.select_param
+                        ),
+                        "schema_context": react_state.get("schema_context"),
+                        "contract_error_type": contract_resolution_error,
+                    }
+                )
+                return _typed_tool_gap(
+                    "source_unavailable",
+                    "no schema-healthy physical datasource was resolved",
+                    evidence,
+                )
             return json.dumps(
                 {
                     "chunks": [
@@ -1934,6 +2270,18 @@ print(json.dumps(summary, ensure_ascii=False))
 
         sql_stripped = sql.strip().rstrip(";")
         sql_upper = sql_stripped.upper().lstrip()
+        if not sql_upper.startswith("SELECT"):
+            return json.dumps(
+                {
+                    "chunks": [
+                        {
+                            "output_type": "text",
+                            "content": "安全限制: 仅支持 SELECT 查询。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         forbidden = [
             "INSERT",
             "UPDATE",
@@ -1961,10 +2309,50 @@ print(json.dumps(summary, ensure_ascii=False))
                     },
                     ensure_ascii=False,
                 )
+        governance_msg = (
+            _validate_hotel_be_sql_query(sql_stripped)
+            if is_hotel_be_data_agent
+            else None
+        )
+        if governance_msg:
+            if query_contract is not None:
+                return _typed_tool_gap("sql_governance_invalid", governance_msg)
+            return json.dumps(
+                {
+                    "chunks": [
+                        {
+                            "output_type": "text",
+                            "content": governance_msg,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        semantic_evidence = None
+        if query_contract is not None:
+            from dbgpt_app.scene.chat_db.query_contract import (
+                validate_sql_semantics,
+            )
+
+            semantic_evidence = validate_sql_semantics(sql_stripped, query_contract)
+            react_state["last_sql_semantics"] = semantic_evidence.model_dump()
+            if not semantic_evidence.valid:
+                return _typed_tool_gap(
+                    "sql_semantic_invalid",
+                    "generated SQL does not satisfy the declared business contract",
+                    semantic_evidence,
+                )
 
         try:
             result = database_connector.run(sql_stripped)
             if not result:
+                if query_contract is not None:
+                    return _typed_tool_gap(
+                        "result_evidence_missing",
+                        "database returned neither column metadata nor rows",
+                        semantic_evidence,
+                    )
                 return json.dumps(
                     {
                         "chunks": [
@@ -1974,26 +2362,129 @@ print(json.dumps(summary, ensure_ascii=False))
                     ensure_ascii=False,
                 )
 
-            # result[0] = column names, result[1:] = data rows
+            # result[0] = column names, result[1:] = data rows. A header-only
+            # result is valid execution evidence for a no-traffic window.
             columns = result[0]
             col_names = [str(c[0]) if isinstance(c, tuple) else str(c) for c in columns]
             rows = result[1:]
+            result_evidence = None
+            if query_contract is not None:
+                from dbgpt_app.scene.chat_db.query_contract import (
+                    validate_result_semantics,
+                )
+
+                result_evidence = validate_result_semantics(
+                    col_names, rows, query_contract
+                )
+                react_state["last_result_semantics"] = result_evidence.model_dump()
+                if not result_evidence.valid:
+                    return _typed_tool_gap(
+                        "result_semantic_invalid",
+                        "executed rows are not equivalent to the declared "
+                        "formula or order",
+                        result_evidence,
+                    )
+            row_dicts = []
+            for row in rows[:50]:
+                if isinstance(row, dict):
+                    values = [row.get(col) for col in col_names]
+                elif hasattr(row, "_mapping"):
+                    values = [row._mapping.get(col) for col in col_names]
+                else:
+                    values = list(row) if isinstance(row, (list, tuple)) else [row]
+                row_dicts.append(
+                    {
+                        col: values[index] if index < len(values) else None
+                        for index, col in enumerate(col_names)
+                    }
+                )
 
             # Build markdown table
             header = "| " + " | ".join(col_names) + " |"
             separator = "| " + " | ".join(["---"] * len(col_names)) + " |"
             md_rows = []
             for row in rows[:50]:
-                md_rows.append("| " + " | ".join(str(v) for v in row) + " |")
+                if isinstance(row, dict):
+                    display_values = [row.get(col) for col in col_names]
+                elif hasattr(row, "_mapping"):
+                    display_values = [row._mapping.get(col) for col in col_names]
+                else:
+                    display_values = row
+                md_rows.append("| " + " | ".join(str(v) for v in display_values) + " |")
             table = "\n".join([header, separator] + md_rows)
+            if (
+                result_evidence is not None
+                and result_evidence.status == "not_evaluable"
+            ):
+                table += (
+                    "\n\nNo evaluable supplier traffic matched the declared rolling "
+                    "window; this is not a 0% failure rate."
+                )
             if len(rows) > 50:
                 table += f"\n\n（仅显示前 50 行，共 {len(rows)} 行）"
 
+            normalized_display = _normalize_sql_display_type(display_type)
+            artifact = {
+                "display_type": normalized_display,
+                "title": str(title or "").strip()
+                or _default_sql_artifact_title(normalized_display),
+                "sql": sql_stripped,
+                "columns": col_names,
+                "rows": row_dicts,
+                "row_count": len(rows),
+            }
+            if query_contract is not None:
+                artifact["provenance"] = {
+                    "contract": {
+                        "version": query_contract.version,
+                        "logical_group": query_contract.logical_group,
+                        "required_capabilities": query_contract.required_capabilities,
+                    },
+                    "physical_source": {
+                        "name": database_name,
+                        "type": getattr(source_resolution, "selected_type", ""),
+                    },
+                    "source_resolution": (
+                        source_resolution.model_dump()
+                        if source_resolution is not None
+                        else None
+                    ),
+                    "schema": react_state.get("schema_context"),
+                    "sql_semantics": semantic_evidence.model_dump(),
+                    "result_semantics": result_evidence.model_dump(),
+                }
+            artifact_json = json.dumps(artifact, default=str, ensure_ascii=False)
             return json.dumps(
-                {"chunks": [{"output_type": "markdown", "content": table}]},
+                {
+                    "chunks": [
+                        {"output_type": "markdown", "content": table},
+                        {
+                            "output_type": "markdown",
+                            "content": (
+                                f"```{normalized_display}\n{artifact_json}\n```"
+                            ),
+                        },
+                    ]
+                },
                 ensure_ascii=False,
             )
         except Exception as e:
+            if query_contract is not None:
+                logger.warning(
+                    "Governed SQL execution failed on datasource=%s: %s",
+                    database_name,
+                    type(e).__name__,
+                    exc_info=e,
+                )
+                return _typed_tool_gap(
+                    "sql_execution_failed",
+                    f"database execution failed with {type(e).__name__}",
+                    {
+                        "source_resolution": react_state.get("source_resolution"),
+                        "schema": react_state.get("schema_context"),
+                        "sql_semantics": react_state.get("last_sql_semantics"),
+                    },
+                )
             return json.dumps(
                 {
                     "chunks": [
@@ -3314,7 +3805,63 @@ print(json.dumps(summary, ensure_ascii=False))
     except Exception:
         pass  # graceful degradation — connector tools are optional
 
-    if is_skill_mode:
+    contract_prompt_context = ""
+    if query_contract is not None:
+        contract_prompt_context = f"""
+## Typed Business Query Contract
+The JSON below is authoritative. Generate SQL that satisfies it exactly; the
+runtime validates the AST and executed rows before returning an artifact.
+{query_contract.model_dump_json(indent=2)}
+"""
+
+    if is_hotel_be_data_agent:
+        workflow_prompt = f"""
+You are DB-GPT executing HotelByte's governed Data Agent live query path.
+The caller is hotel-be and ext_info.source is hotel-be-data-agent.
+Please always respond in the same language as the user's input language.
+
+## Execution Contract
+1. Use only the selected DB-GPT datasource and the `sql_query` tool.
+2. Execute at most two SELECT-only SQL queries, then call `terminate`.
+3. Do not use skills, shell/code execution, html_interpreter, todowrite, external
+   tools, fixtures, examples, synthetic rows, or demo data.
+4. If schema, SQL execution, or live data is unavailable, terminate with a clear
+   typed data/source gap. Do not invent rows or metrics.
+5. For recent-hour/day questions, SQL must include an explicit time window.
+6. For rankings, tables, breakdowns, and top-N outputs, SQL must include LIMIT <= 100.
+   For trend aggregations, include LIMIT <= 100 on the grouped result.
+
+## SQL Tool Usage
+- Table/ranking answer: call `sql_query` with
+  {{"display_type": "response_table", "title": "..."}}.
+- Trend answer: call `sql_query` with
+  {{"display_type": "response_line_chart", "title": "..."}}.
+- Distribution/top breakdown answer: call `sql_query` with
+  {{"display_type": "response_bar_chart", "title": "..."}}.
+
+## Final Answer Contract
+After `sql_query` returns live rows, call `terminate` with a concise final answer.
+Use canonical Action Input {{"output": "final answer"}} for `terminate`.
+The final answer must preserve the SQL口径: datasource/table, selected metrics,
+time window, filters, grouping, ordering, LIMIT, and row count. If the
+`sql_query` observation contains a fenced response_table/response_line_chart/
+response_bar_chart JSON block, summarize it; do not rewrite it with fabricated
+values.
+
+{database_context}
+{contract_prompt_context}
+
+## ReAct Output Format
+Must output for each interaction round:
+Thought: brief reasoning for the next database action
+Action Intention: concise user-facing step title
+Action Reason: concise reason this step is needed
+Action: The selected tool name
+Action Input: JSON tool parameters
+""".strip()
+
+        tool_pack = ToolPack([sql_query, Terminate()])
+    elif is_skill_mode:
         # Simplified prompt for skill mode - only skill-related tools +
         # html_interpreter
         workflow_prompt = f"""
@@ -3335,7 +3882,7 @@ documentation references them. When using template mode, provide ALL required
 placeholders in the `data` dictionary.
 5. If the task does not require generating a report, directly call terminate to
 return the final result. The Action Input format must be
-{{"result": "final answer"}}.
+{{"output": "final answer"}}.
 
 {skill_prompt_context}
 {execution_instruction}
@@ -3413,7 +3960,7 @@ IMPORTANT: You MUST call todowrite again after EACH task completes to update sta
 The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
 8. **terminate**: Return the final answer when the task is completed. Action Input
-must be {{"result": "your final answer content"}}.
+must be {{"output": "your final answer content"}}.
 
 ## Task Management
 For complex tasks that require 3 or more steps, use the `todowrite` tool to create
@@ -3480,7 +4027,7 @@ order, select as needed).
    -> Action Input.
 4. Wait for the system to return Observation before deciding on the next step.
 5. When the task is completed, call the terminate tool to return the final result.
-The Action Input format must be {{"result": "final answer"}}.
+The Action Input format must be {{"output": "final answer"}}.
 6. **[Mandatory Rule] If there is a requirement for an analysis report, you MUST call
 `html_interpreter` for HTML rendering. When the user requests generating a webpage,
 HTML report, or interactive report, the final presentation step must call
@@ -3576,7 +4123,7 @@ File mode: {{"file_path": "/path/to/report.html"}}
 IMPORTANT: You MUST call todowrite again after EACH task completes to update status.
 The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
-15. **terminate**: Finish the task. Parameters: {{"result": "final answer"}}
+15. **terminate**: Finish the task. Parameters: {{"output": "final answer"}}
 
 {business_tool_descriptions}
 {file_context}
@@ -3713,8 +4260,9 @@ Action Input: The JSON format of tool parameters
         template_format="jinja2",
     )
 
+    agent_max_retry_count = 6 if is_hotel_be_data_agent else 15
     agent_builder = (
-        ReActAgent(max_retry_count=15)
+        ReActAgent(max_retry_count=agent_max_retry_count)
         .bind(context)
         .bind(agent_memory)
         .bind(llm_config)
@@ -3897,9 +4445,8 @@ Action Input: The JSON format of tool parameters
                 else:
                     action_input_data = action_input
 
-            # Skip step display for terminate action — its output will be
-            # sent as a streaming "final" event instead of a step card.
-            # Also skip emitting the thought for terminate since it's noise.
+            # Do not display terminate content as a step card. A thinking_chunk
+            # may already have opened the round, so close that exact step first.
             # Note: TerminateAction.run() sets terminate=True but does NOT
             # set the action field, so we must check the terminate boolean.
             is_terminate = action_output.get("terminate") or (
@@ -3909,6 +4456,9 @@ Action Input: The JSON format of tool parameters
                 pending_thoughts.pop(round_num, [])
                 pending_action_intentions.pop(round_num, None)
                 pending_action_reasons.pop(round_num, None)
+                terminate_step_event = close_terminate_step(round_step_map, round_num)
+                if terminate_step_event:
+                    yield terminate_step_event
                 # ── Auto-complete all remaining todos on terminate ──
                 if _todo_list:
                     for t in _todo_list:
@@ -4183,7 +4733,8 @@ Action Input: The JSON format of tool parameters
     try:
         reply = await agent_task
     except Exception as e:
-        err_msg = f"React agent failed: {e}"
+        error_code = classify_react_agent_error(e)
+        err_msg = REACT_AGENT_ERROR_MESSAGES[error_code]
         error_payload = json.dumps(
             {
                 "version": 1,
@@ -4198,30 +4749,13 @@ Action Input: The JSON format of tool parameters
         storage_conv.add_view_message(error_payload)
         storage_conv.end_current_round()
         storage_conv.save_to_storage()
-        yield _sse_event({"type": "final", "content": err_msg})
-        yield _sse_event({"type": "done"})
+        for terminal_event in terminal_error_events(e):
+            yield terminal_event
         return
 
     if reply.action_report and reply.action_report.terminate:
         raw_content = reply.action_report.content or ""
-        # The terminate ActionOutput.content is the full raw LLM text, e.g.:
-        # "Thought: ...\nAction: terminate\nAction Input: {"result": "..."}"
-        # We need to extract the "result" value from Action Input.
-        final_content = raw_content
-        try:
-            steps = parser.parse(raw_content)
-            if steps:
-                action_input = steps[0].action_input
-                if action_input:
-                    # action_input could be a string like '{"result": "..."}'
-                    if isinstance(action_input, str):
-                        parsed_input = json.loads(action_input)
-                    else:
-                        parsed_input = action_input
-                    if isinstance(parsed_input, dict) and "result" in parsed_input:
-                        final_content = parsed_input["result"]
-        except Exception:
-            pass
+        final_content = _extract_terminate_output(raw_content, parser)
     elif reply.action_report:
         # Loop ended without terminate (max retries or timeout).
         # reply.content is raw LLM output containing ReAct prefixes.
@@ -4268,7 +4802,7 @@ Action Input: The JSON format of tool parameters
     storage_conv.save_to_storage()
 
     yield _sse_event({"type": "final", "content": final_content})
-    yield _sse_event({"type": "done"})
+    yield _sse_event({"type": "done", "status": "done"})
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,11 @@ from dbgpt.model.adapter.loader import ModelLoader
 from dbgpt.model.adapter.model_adapter import get_llm_model_adapter
 from dbgpt.model.cluster.worker_base import ModelWorker
 from dbgpt.model.proxy.base import TiktokenProxyTokenizer
+from dbgpt.model.proxy.llms.provider_error import (
+    StructuredOutputUnsupportedError,
+    model_output_from_provider_error,
+)
+from dbgpt.model.proxy.llms.proxy_model import ProxyModel
 from dbgpt.util.executor_utils import blocking_func_to_async_no_executor
 from dbgpt.util.model_utils import _clear_model_cache, _get_current_cuda_memory
 from dbgpt.util.parameter_utils import _get_dict_from_obj
@@ -209,6 +214,10 @@ class DefaultModelWorker(ModelWorker):
 
     def generate(self, params: Dict) -> ModelOutput:
         """Generate non stream result"""
+        try:
+            self._validate_response_format_support(params)
+        except StructuredOutputUnsupportedError as exc:
+            return self._handle_exception(exc)
         output = None
         if self._support_generate_func:
             (
@@ -336,6 +345,10 @@ class DefaultModelWorker(ModelWorker):
             span.end(metadata={"error": output.to_dict()})
 
     async def async_generate(self, params: Dict) -> ModelOutput:
+        try:
+            self._validate_response_format_support(params)
+        except StructuredOutputUnsupportedError as exc:
+            return self._handle_exception(exc)
         if self._support_generate_func:
             (
                 params,
@@ -379,6 +392,7 @@ class DefaultModelWorker(ModelWorker):
     def _prepare_generate_stream(
         self, params: Dict, span_operation_name: str, is_stream=True
     ):
+        self._validate_response_format_support(params)
         if self.llm_adapter.is_reasoning_model(
             self._model_params, self.model_name.lower()
         ):
@@ -458,6 +472,16 @@ class DefaultModelWorker(ModelWorker):
 
         return params, model_context, func, model_span
 
+    def _validate_response_format_support(self, params: Dict) -> None:
+        """Reject structured output unless the active provider declares support."""
+        if params.get("response_format") is None:
+            return
+        if not isinstance(self.model, ProxyModel):
+            raise StructuredOutputUnsupportedError
+        client = self.model.proxy_llm_client
+        if not client or not client.supports_response_format:
+            raise StructuredOutputUnsupportedError
+
     def _handle_output(
         self,
         output,
@@ -500,10 +524,15 @@ class DefaultModelWorker(ModelWorker):
 
         metrics = _new_metrics_from_model_output(last_metrics, is_first_generate, usage)
         model_output.metrics = metrics
-        model_output.model_context = model_context
+        merged_model_context = dict(model_context or {})
+        if model_output.model_context:
+            merged_model_context.update(model_output.model_context)
+        model_output.model_context = merged_model_context
         return model_output, incremental_output, current_output, metrics
 
     def _handle_exception(self, e):
+        if isinstance(e, StructuredOutputUnsupportedError):
+            return model_output_from_provider_error(e)
         # Check if the exception is a torch.cuda.CudaError and if torch was imported.
         if _torch_imported and isinstance(e, torch.cuda.CudaError):
             model_output = ModelOutput(

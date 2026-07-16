@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from concurrent.futures import Executor
@@ -29,6 +30,11 @@ from dbgpt.model.proxy.base import (
     register_proxy_model_adapter,
 )
 from dbgpt.model.proxy.llms.chatgpt import OpenAICompatibleDeployModelParameters
+from dbgpt.model.proxy.llms.provider_error import (
+    StructuredOutputInvalidError,
+    StructuredOutputUnsupportedError,
+    model_output_from_provider_error,
+)
 from dbgpt.model.proxy.llms.proxy_model import ProxyModel, parse_model_request
 from dbgpt.util.i18n_utils import _
 
@@ -77,7 +83,12 @@ async def claude_generate_stream(
 ) -> AsyncIterator[ModelOutput]:
     client: ClaudeLLMClient = cast(ClaudeLLMClient, model.proxy_llm_client)
     stream = _request_stream_enabled(params)
-    request = parse_model_request(params, client.default_model, stream=stream)
+    request = parse_model_request(
+        params,
+        client.default_model,
+        stream=stream,
+        response_format_supported=True,
+    )
     if not stream:
         yield await client.generate(request)
         return
@@ -96,6 +107,8 @@ def _request_stream_enabled(params: Dict[str, Any]) -> bool:
 
 
 class ClaudeLLMClient(ProxyLLMClient):
+    supports_response_format = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -214,7 +227,7 @@ class ClaudeLLMClient(ProxyLLMClient):
         # Apply claude kwargs
         for k, v in self._claude_kwargs.items():
             payload[k] = v
-        if request.temperature:
+        if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_new_tokens:
             payload["max_tokens"] = request.max_new_tokens
@@ -222,6 +235,20 @@ class ClaudeLLMClient(ProxyLLMClient):
             payload["stop"] = request.stop
         if request.top_p:
             payload["top_p"] = request.top_p
+        if request.response_format is not None:
+            json_schema = request.response_format.get("json_schema") or {}
+            schema = json_schema.get("schema")
+            name = json_schema.get("name")
+            if not isinstance(schema, dict) or not isinstance(name, str):
+                raise StructuredOutputUnsupportedError
+            tool = {
+                "name": name,
+                "description": json_schema.get("description")
+                or "Emit the final structured response.",
+                "input_schema": schema,
+            }
+            payload["tools"] = [tool]
+            payload["tool_choice"] = {"type": "tool", "name": name}
         return payload
 
     async def generate(
@@ -236,6 +263,7 @@ class ClaudeLLMClient(ProxyLLMClient):
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
+        usage = None
         try:
             if "max_tokens" not in payload:
                 max_tokens = 1024
@@ -247,26 +275,28 @@ class ClaudeLLMClient(ProxyLLMClient):
                 messages=messages,
                 **payload,
             )
-            usage = None
             finish_reason = response.stop_reason
             if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.input_tokens,
-                    "completion_tokens": response.usage.output_tokens,
-                }
+                usage = _anthropic_usage(response.usage)
             response_content = response.content
             if not response_content:
                 raise ValueError("Response content is empty")
+            text = (
+                _structured_response_text(response_content, request.response_format)
+                if request.response_format is not None
+                else response_content[0].text
+            )
             return ModelOutput(
-                text=response_content[0].text,
+                text=text,
                 error_code=0,
                 finish_reason=finish_reason,
                 usage=usage,
             )
         except Exception as e:
-            return ModelOutput(
-                text=f"**Claude Generate Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
+            return model_output_from_provider_error(
+                e,
+                structured_output_requested=request.response_format is not None,
+                usage=usage,
             )
 
     async def generate_stream(
@@ -297,16 +327,16 @@ class ClaudeLLMClient(ProxyLLMClient):
             ) as stream:
                 async for text in stream.text_stream:
                     full_text += text
-                    raw_usage = stream.current_message_snapshot.usage
-                    usage = {
-                        "prompt_tokens": raw_usage.input_tokens,
-                        "completion_tokens": raw_usage.output_tokens,
-                    }
-                    yield ModelOutput(text=full_text, error_code=0, usage=usage)
+                    yield ModelOutput(text=full_text, error_code=0)
+                final_message = await stream.get_final_message()
+                yield ModelOutput(
+                    text=full_text,
+                    error_code=0,
+                    usage=_anthropic_usage(final_message.usage),
+                )
         except Exception as e:
-            yield ModelOutput(
-                text=f"**Claude Generate Stream Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
+            yield model_output_from_provider_error(
+                e, structured_output_requested=request.response_format is not None
             )
 
     async def models(self) -> List[ModelMetadata]:
@@ -328,6 +358,49 @@ class ClaudeLLMClient(ProxyLLMClient):
         return self.context_length
 
 
+def _anthropic_usage(raw_usage: Any) -> Dict[str, int]:
+    prompt_tokens = sum(
+        int(getattr(raw_usage, field, 0) or 0)
+        for field in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+    completion_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _structured_response_text(
+    response_content: List[Any], response_format: Dict[str, Any]
+) -> str:
+    """Serialize the forced Anthropic tool input as the assistant JSON response."""
+    json_schema = response_format.get("json_schema") or {}
+    expected_name = json_schema.get("name")
+    for block in response_content:
+        block_type = block.get("type") if isinstance(block, dict) else getattr(
+            block, "type", None
+        )
+        block_name = block.get("name") if isinstance(block, dict) else getattr(
+            block, "name", None
+        )
+        if block_type != "tool_use" or block_name != expected_name:
+            continue
+        value = (
+            block.get("input")
+            if isinstance(block, dict)
+            else getattr(block, "input", None)
+        )
+        if not isinstance(value, dict):
+            break
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    raise StructuredOutputInvalidError
+
+
 def _inline_system_messages(
     messages: List[Dict[str, Any]], system_messages: List[str]
 ) -> List[Dict[str, Any]]:
@@ -337,7 +410,12 @@ def _inline_system_messages(
     if not system_text:
         return messages
     if not messages:
-        return [{"role": "user", "content": system_text}]
+        return [
+            {
+                "role": "user",
+                "content": _format_inlined_system(system_text, ""),
+            }
+        ]
 
     inlined = [dict(message) for message in messages]
     first_message = inlined[0]
