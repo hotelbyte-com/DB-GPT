@@ -1110,7 +1110,10 @@ def _optional_str(value: Any) -> Optional[str]:
 
 
 def _react_agent_database_name(
-    dialogue: ConversationVo, user_input: str, resolver: Optional[Any] = None
+    dialogue: ConversationVo,
+    user_input: str,
+    resolver: Optional[Any] = None,
+    hints: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Resolve the concrete datasource for ReAct without requiring UI selection.
 
@@ -1135,7 +1138,9 @@ def _react_agent_database_name(
         resolver = resolve_chat_data_source
 
     try:
-        resolved = _optional_str(resolver(select_param, user_input, CFG.SYSTEM_APP))
+        resolved = _optional_str(
+            resolver(select_param, user_input, CFG.SYSTEM_APP, hints)
+        )
         if resolved:
             if resolved != select_param:
                 logger.info(
@@ -1167,6 +1172,9 @@ def _react_agent_contract_resolution(
 
     from dbgpt_app.scene.chat_db.query_contract import parse_data_query_contract
 
+    ext_info = dialogue.ext_info if isinstance(dialogue.ext_info, dict) else {}
+    if "query_contract" in ext_info and not _is_hotel_be_data_agent_source(ext_info):
+        raise ValueError("query_contract_source_invalid")
     contract = parse_data_query_contract(dialogue.ext_info)
     if contract is None:
         return None, None
@@ -1234,9 +1242,7 @@ def _typed_tool_gap(kind: str, reason: str, evidence: Any = None) -> str:
 
 def _declares_governed_query_contract(dialogue: ConversationVo) -> bool:
     return bool(
-        _is_hotel_be_data_agent_source(dialogue.ext_info)
-        and isinstance(dialogue.ext_info, dict)
-        and "query_contract" in dialogue.ext_info
+        isinstance(dialogue.ext_info, dict) and "query_contract" in dialogue.ext_info
     )
 
 
@@ -1310,59 +1316,21 @@ async def _general_react_agent_stream(
     is_hotel_be_data_agent = _is_hotel_be_data_agent_source(dialogue.ext_info)
     if is_hotel_be_data_agent:
         user_input = _extract_hotel_be_user_question(user_input)
+    # Declared contracts are intercepted by _react_agent_stream before this
+    # general ReAct path. Keep these defaults for the existing tool and prompt
+    # state without re-resolving or weakening that governed boundary here.
     query_contract = None
     source_resolution = None
     contract_resolution_error = ""
-    if is_hotel_be_data_agent:
-        try:
-            query_contract, source_resolution = _react_agent_contract_resolution(
-                dialogue, user_input
-            )
-        except Exception as exc:
-            contract_resolution_error = type(exc).__name__
-            logger.warning(
-                "HotelByte data-query contract resolution failed: %s",
-                contract_resolution_error,
-                exc_info=exc,
-            )
-    if query_contract is not None:
-        if source_resolution is not None and source_resolution.status == "selected":
-            database_name = source_resolution.selected
-        else:
-            database_name = None
-    elif not contract_resolution_error:
-        database_name = _react_agent_database_name(dialogue, user_input)
+    routing_hints = dialogue.ext_info if isinstance(dialogue.ext_info, dict) else None
+    database_name = _react_agent_database_name(
+        dialogue,
+        user_input,
+        hints=routing_hints,
+    )
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
-
-    # Legacy requests without a governed query contract still need their logical
-    # group resolved to a physical datasource. Declared contracts are routed by
-    # _react_agent_stream before this general ReAct path and must never fall back
-    # to best-effort question scoring after a typed resolution failure.
-    if (
-        not database_name
-        and dialogue.select_param
-        and query_contract is None
-        and not contract_resolution_error
-    ):
-        try:
-            from dbgpt_app.scene.chat_db.datasource_router import (
-                resolve_chat_data_source,
-            )
-
-            database_name = resolve_chat_data_source(
-                str(dialogue.select_param),
-                user_input,
-                CFG.SYSTEM_APP,
-                dialogue.ext_info if isinstance(dialogue.ext_info, dict) else None,
-            )
-        except Exception as e:
-            logger.warning(
-                "resolve_chat_data_source failed for react-agent select_param=%s: %s",
-                dialogue.select_param,
-                e,
-            )
 
     def build_step(title: str, detail: str, phase: str = None):
         nonlocal step

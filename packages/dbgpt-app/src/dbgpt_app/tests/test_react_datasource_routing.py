@@ -28,8 +28,8 @@ def test_react_datasource_routing_prefers_explicit_database_name():
 def test_react_datasource_routing_resolves_logical_select_param():
     calls = []
 
-    def resolver(select_param, user_input, system_app):
-        calls.append((select_param, user_input))
+    def resolver(select_param, user_input, system_app, hints):
+        calls.append((select_param, user_input, hints))
         return "hoteldev"
 
     dialogue = ConversationVo(
@@ -42,11 +42,11 @@ def test_react_datasource_routing_resolves_logical_select_param():
         _react_agent_database_name(dialogue, "count bookings", resolver=resolver)
         == "hoteldev"
     )
-    assert calls == [("hotel-be", "count bookings")]
+    assert calls == [("hotel-be", "count bookings", None)]
 
 
 def test_react_datasource_routing_falls_back_to_select_param_on_resolver_error():
-    def resolver(select_param, user_input, system_app):
+    def resolver(select_param, user_input, system_app, hints):
         raise RuntimeError("resolver unavailable")
 
     dialogue = ConversationVo(
@@ -59,6 +59,32 @@ def test_react_datasource_routing_falls_back_to_select_param_on_resolver_error()
         _react_agent_database_name(dialogue, "count bookings", resolver=resolver)
         == "hotel-be"
     )
+
+
+def test_react_datasource_routing_passes_structured_hints_once():
+    calls = []
+
+    def resolver(select_param, user_input, system_app, hints):
+        calls.append((select_param, user_input, hints))
+        return "hblog_ns"
+
+    hints = {"allowed_tables": ["hb_log"]}
+    dialogue = ConversationVo(
+        select_param="hotel-be",
+        ext_info=hints,
+        user_input="supplier failure rate",
+    )
+
+    assert (
+        _react_agent_database_name(
+            dialogue,
+            "supplier failure rate",
+            resolver=resolver,
+            hints=hints,
+        )
+        == "hblog_ns"
+    )
+    assert calls == [("hotel-be", "supplier failure rate", hints)]
 
 
 def _contract_ext_info():
@@ -113,6 +139,23 @@ def test_typed_contract_rejects_caller_physical_datasource_override():
         _react_agent_contract_resolution(dialogue, "supplier reliability")
 
 
+@pytest.mark.parametrize("source", [None, "other-agent"])
+def test_typed_contract_rejects_missing_or_wrong_source(source):
+    ext_info = _contract_ext_info()
+    if source is None:
+        ext_info.pop("source")
+    else:
+        ext_info["source"] = source
+    dialogue = ConversationVo(
+        select_param="hotel-be",
+        ext_info=ext_info,
+        user_input="supplier reliability",
+    )
+
+    with pytest.raises(ValueError, match="query_contract_source_invalid"):
+        _react_agent_contract_resolution(dialogue, "supplier reliability")
+
+
 @pytest.mark.asyncio
 async def test_declared_contract_stream_never_enters_general_llm_loop(monkeypatch):
     calls = []
@@ -143,3 +186,33 @@ async def test_declared_contract_stream_never_enters_general_llm_loop(monkeypatc
 
     assert events == ["data: governed\n\n"]
     assert calls == ["governed"]
+
+
+@pytest.mark.parametrize("source", [None, "other-agent"])
+@pytest.mark.asyncio
+async def test_declared_contract_with_invalid_source_returns_typed_gap(
+    monkeypatch, source
+):
+    async def general(dialogue):
+        raise AssertionError("declared contract must not enter the general LLM loop")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        "dbgpt_app.openapi.api_v1.agentic_data_api._general_react_agent_stream",
+        general,
+    )
+    ext_info = _contract_ext_info()
+    if source is None:
+        ext_info.pop("source")
+    else:
+        ext_info["source"] = source
+    dialogue = ConversationVo(
+        select_param="hotel-be",
+        ext_info=ext_info,
+        user_input="supplier reliability",
+    )
+
+    events = [event async for event in _react_agent_stream(dialogue)]
+
+    assert "Data query gap [contract_invalid]" in "".join(events)
+    assert any('"type": "done", "status": "done"' in event for event in events)
