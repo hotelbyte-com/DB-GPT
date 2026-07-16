@@ -302,7 +302,15 @@ async def test_no_stream_wrapper_fails_closed_on_invalid_structured_output():
     class Chat:
         async def nostream_call_with_output(self):
             content = '{"answer":"选择"新增"后保存"}'
-            return content, ModelOutput.build(content)
+            return content, ModelOutput(
+                text=content,
+                error_code=0,
+                usage={
+                    "prompt_tokens": 11,
+                    "completion_tokens": 3,
+                    "total_tokens": 14,
+                },
+            )
 
     response = await no_stream_wrapper(request, Chat())
     body = json.loads(response.body)
@@ -310,6 +318,12 @@ async def test_no_stream_wrapper_fails_closed_on_invalid_structured_output():
     assert response.status_code == 502
     assert body["error"]["type"] == "structured_output_error"
     assert body["error"]["code"] == "structured_output_invalid"
+    assert body["model"] == "test-model"
+    assert body["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 3,
+        "total_tokens": 14,
+    }
 
 
 @pytest.mark.asyncio
