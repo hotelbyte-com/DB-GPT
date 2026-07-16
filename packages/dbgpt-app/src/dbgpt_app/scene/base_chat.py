@@ -557,6 +557,11 @@ class BaseChat(ABC):
             self.current_message.add_view_message(view_message)
             self.message_adjust()
             span.end()
+        except ContextAppException as e:
+            if not e.model_output.success:
+                final_output = e.model_output
+            self.current_message.add_view_message(e.get_ui_error())
+            span.end(metadata={"error": str(e)})
         except BaseAppException as e:
             self.current_message.add_view_message(e.get_ui_error())
             span.end(metadata={"error": str(e)})

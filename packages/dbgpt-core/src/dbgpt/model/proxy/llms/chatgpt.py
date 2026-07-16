@@ -18,6 +18,7 @@ from dbgpt.model.proxy.base import (
     ProxyLLMClient,
     register_proxy_model_adapter,
 )
+from dbgpt.model.proxy.llms.provider_error import model_output_from_provider_error
 from dbgpt.model.proxy.llms.proxy_model import ProxyModel, parse_model_request
 from dbgpt.model.utils.chatgpt_utils import OpenAIParameters
 from dbgpt.util.i18n_utils import _
@@ -284,10 +285,7 @@ class OpenAILLMClient(ProxyLLMClient):
         try:
             return await self.generate_v1(messages, payload)
         except Exception as e:
-            return ModelOutput(
-                text=f"**LLMServer Generate Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
-            )
+            return model_output_from_provider_error(e)
 
     async def generate_stream(
         self,

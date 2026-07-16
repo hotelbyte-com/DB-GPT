@@ -29,6 +29,7 @@ from dbgpt.model.proxy.base import (
     register_proxy_model_adapter,
 )
 from dbgpt.model.proxy.llms.chatgpt import OpenAICompatibleDeployModelParameters
+from dbgpt.model.proxy.llms.provider_error import model_output_from_provider_error
 from dbgpt.model.proxy.llms.proxy_model import ProxyModel, parse_model_request
 from dbgpt.util.i18n_utils import _
 
@@ -261,10 +262,7 @@ class ClaudeLLMClient(ProxyLLMClient):
                 usage=usage,
             )
         except Exception as e:
-            return ModelOutput(
-                text=f"**Claude Generate Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
-            )
+            return model_output_from_provider_error(e)
 
     async def generate_stream(
         self,
@@ -302,10 +300,7 @@ class ClaudeLLMClient(ProxyLLMClient):
                     usage=_anthropic_usage(final_message.usage),
                 )
         except Exception as e:
-            yield ModelOutput(
-                text=f"**Claude Generate Stream Error, Please CheckErrorInfo.**: {e}",
-                error_code=1,
-            )
+            yield model_output_from_provider_error(e)
 
     async def models(self) -> List[ModelMetadata]:
         model_metadata = ModelMetadata(

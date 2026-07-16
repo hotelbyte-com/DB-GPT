@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from dbgpt.core import ModelMessage, ModelRequest
+from dbgpt.core.schema.api import ErrorCode
 from dbgpt.model.proxy.llms.claude import (
     ClaudeLLMClient,
     _anthropic_usage,
@@ -117,12 +118,42 @@ async def test_stream_emits_final_anthropic_usage():
     assert stream.final_message_requested
 
 
+@pytest.mark.asyncio
+async def test_generate_classifies_anthropic_rate_limit_without_leaking_body():
+    client = ClaudeLLMClient(
+        model="test-model",
+        model_alias="test-model",
+        client=SimpleNamespace(messages=_FailingMessages()),
+    )
+    request = ModelRequest(
+        model="test-model",
+        messages=[ModelMessage(role="user", content="hi")],
+    )
+
+    output = await client.generate(request)
+
+    assert output.error_code == ErrorCode.RATE_LIMIT.value
+    assert output.model_context == {
+        "upstream_error": {"kind": "rate_limit", "status_code": 429}
+    }
+    assert "secret-provider-body" not in output.text
+
+
 class _FakeMessages:
     def __init__(self, stream):
         self._stream = stream
 
     def stream(self, **kwargs):
         return self._stream
+
+
+class _TypedProviderError(Exception):
+    status_code = 429
+
+
+class _FailingMessages:
+    async def create(self, **_kwargs):
+        raise _TypedProviderError("secret-provider-body")
 
 
 class _FakeMessageStream:

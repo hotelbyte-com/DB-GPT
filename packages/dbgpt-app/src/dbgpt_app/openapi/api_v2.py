@@ -2,13 +2,13 @@ import json
 import re
 import time
 import uuid
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Literal, Optional, Union
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.responses import JSONResponse, StreamingResponse
 
-from dbgpt._private.pydantic import model_to_dict, model_to_json
+from dbgpt._private.pydantic import BaseModel, model_to_dict, model_to_json
 from dbgpt.component import SystemApp, logger
 from dbgpt.core.schema.api import (
     ChatCompletionResponse,
@@ -21,6 +21,10 @@ from dbgpt.core.schema.api import (
     UsageInfo,
 )
 from dbgpt.model.cluster.apiserver.api import APISettings
+from dbgpt.model.proxy.llms.provider_error import (
+    UpstreamErrorKind,
+    upstream_provider_error_from_output,
+)
 from dbgpt.util.executor_utils import blocking_func_to_async
 from dbgpt.util.tracer import SpanType, root_tracer
 from dbgpt_app.openapi.api_v1.api_v1 import (
@@ -39,6 +43,21 @@ from dbgpt_serve.flow.api.endpoints import get_service
 router = APIRouter()
 api_settings = APISettings()
 get_bearer_token = HTTPBearer(auto_error=False)
+
+
+class UpstreamProviderErrorDetail(BaseModel):
+    """Sanitized provider error contract for no-stream callers."""
+
+    message: str
+    type: Literal["upstream_provider_error"] = "upstream_provider_error"
+    code: UpstreamErrorKind
+    upstream_status: Optional[int]
+
+
+class UpstreamProviderErrorResponse(BaseModel):
+    """OpenAI-compatible provider error envelope."""
+
+    error: UpstreamProviderErrorDetail
 
 
 async def check_api_key(
@@ -252,7 +271,7 @@ async def get_chat_instance(
 
 async def no_stream_wrapper(
     request: ChatCompletionRequestBody, chat: BaseChat
-) -> ChatCompletionResponse:
+) -> Union[ChatCompletionResponse, JSONResponse]:
     """
     no stream wrapper
     Args:
@@ -263,6 +282,8 @@ async def no_stream_wrapper(
         response, final_output = await chat.nostream_call_with_output()
         if final_output is None:
             raise RuntimeError("model response did not include a final output")
+        if not final_output.success:
+            return _upstream_provider_error_response(final_output)
         msg = response.replace("\ufffd", "").replace("&quot;", '"')
         choice_data = ChatCompletionResponseChoice(
             index=0,
@@ -282,6 +303,24 @@ async def no_stream_wrapper(
         return ChatCompletionResponse(
             id=request.conv_uid, choices=[choice_data], model=request.model, usage=usage
         )
+
+
+def _upstream_provider_error_response(final_output) -> JSONResponse:
+    provider_error = upstream_provider_error_from_output(final_output)
+    if provider_error.kind == "rate_limit":
+        status_code = 429
+        message = "Upstream model provider rate limited the request."
+    else:
+        status_code = 502
+        message = "Upstream model provider request failed."
+    body = UpstreamProviderErrorResponse(
+        error=UpstreamProviderErrorDetail(
+            message=message,
+            code=provider_error.kind,
+            upstream_status=provider_error.status_code,
+        )
+    )
+    return JSONResponse(model_to_dict(body), status_code=status_code)
 
 
 async def chat_app_stream_wrapper(request: ChatCompletionRequestBody = None):
