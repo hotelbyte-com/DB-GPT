@@ -1114,6 +1114,7 @@ def _react_agent_database_name(
     user_input: str,
     resolver: Optional[Any] = None,
     hints: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve the concrete datasource for ReAct without requiring UI selection.
 
@@ -1123,14 +1124,15 @@ def _react_agent_database_name(
     instead of binding ReAct to a user-selected physical database.
     """
 
+    explicit_database = None
     if dialogue.ext_info and isinstance(dialogue.ext_info, dict):
         explicit_database = _optional_str(dialogue.ext_info.get("database_name"))
-        if explicit_database:
-            return explicit_database
 
-    select_param = _optional_str(dialogue.select_param)
+    select_param = explicit_database or _optional_str(dialogue.select_param)
     if not select_param:
         return None
+    if not user_id:
+        raise PermissionError("caller_identity_missing")
 
     if resolver is None:
         from dbgpt_app.scene.chat_db.datasource_router import resolve_chat_data_source
@@ -1139,7 +1141,7 @@ def _react_agent_database_name(
 
     try:
         resolved = _optional_str(
-            resolver(select_param, user_input, CFG.SYSTEM_APP, hints)
+            resolver(select_param, user_input, CFG.SYSTEM_APP, hints, user_id)
         )
         if resolved:
             if resolved != select_param:
@@ -1149,13 +1151,16 @@ def _react_agent_database_name(
                     resolved,
                 )
             return resolved
+    except PermissionError:
+        raise
     except Exception as exc:
         logger.warning(
             "Failed to resolve ReAct datasource from select_param=%s",
             select_param,
             exc_info=exc,
         )
-    return select_param
+        raise RuntimeError("datasource_resolution_failed") from exc
+    raise RuntimeError("datasource_resolution_empty")
 
 
 def _react_agent_contract_resolution(
@@ -1192,6 +1197,7 @@ def _react_agent_contract_resolution(
         user_input,
         CFG.SYSTEM_APP,
         contract=contract,
+        user_id=_optional_str(dialogue.user_name),
     )
     return contract, resolution
 
@@ -1323,11 +1329,52 @@ async def _general_react_agent_stream(
     source_resolution = None
     contract_resolution_error = ""
     routing_hints = dialogue.ext_info if isinstance(dialogue.ext_info, dict) else None
-    database_name = _react_agent_database_name(
-        dialogue,
-        user_input,
-        hints=routing_hints,
-    )
+    source_gap_kind = ""
+    source_gap_reason = ""
+    try:
+        database_name = _react_agent_database_name(
+            dialogue,
+            user_input,
+            hints=routing_hints,
+            user_id=_optional_str(dialogue.user_name),
+        )
+    except PermissionError:
+        database_name = None
+        source_gap_kind = "insufficient_scope"
+        source_gap_reason = (
+            "the authenticated caller has no authorized datasource candidate"
+        )
+    except Exception:
+        database_name = None
+        source_gap_kind = "source_unavailable"
+        source_gap_reason = "datasource resolution failed before connector selection"
+
+    if source_gap_kind:
+        gap_content = _typed_tool_gap(
+            source_gap_kind,
+            source_gap_reason,
+        )
+        step_id = "step-1"
+        yield _sse_event(
+            {
+                "type": "step.start",
+                "step": 1,
+                "id": step_id,
+                "title": "resolve_authorized_datasource",
+                "detail": "Resolve datasource membership for the authenticated caller",
+            }
+        )
+        yield _sse_event(
+            {
+                "type": "step.chunk",
+                "id": step_id,
+                "output_type": "text",
+                "content": gap_content,
+            }
+        )
+        yield _sse_event({"type": "step.done", "id": step_id, "status": "failed"})
+        yield _sse_event({"type": "done", "status": "failed"})
+        return
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)

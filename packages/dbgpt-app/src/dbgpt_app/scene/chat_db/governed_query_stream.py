@@ -61,8 +61,11 @@ async def stream_governed_query_contract(
     async for event in _outcome_events(contract, outcome):
         yield event
     _persist_history(dialogue, user_input, contract, outcome, system_app)
-    yield _sse_event({"type": "final", "content": outcome.final_content})
-    yield _sse_event({"type": "done", "status": "done"})
+    if outcome.status == "executed":
+        yield _sse_event({"type": "final", "content": outcome.final_content})
+        yield _sse_event({"type": "done", "status": "done"})
+    else:
+        yield _sse_event({"type": "done", "status": "failed"})
 
 
 def _resolve_and_compile(
