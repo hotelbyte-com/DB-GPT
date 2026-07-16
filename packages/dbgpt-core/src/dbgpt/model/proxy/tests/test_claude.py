@@ -187,6 +187,11 @@ async def test_generate_rejects_missing_forced_tool_response():
             "status_code": None,
         }
     }
+    assert output.usage == {
+        "prompt_tokens": 4,
+        "completion_tokens": 3,
+        "total_tokens": 7,
+    }
 
 
 @pytest.mark.asyncio

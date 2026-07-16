@@ -1,7 +1,7 @@
 """Typed, sanitized errors returned by upstream model providers."""
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 from dbgpt.core import ModelOutput
 from dbgpt.core.schema.api import ErrorCode
@@ -32,7 +32,9 @@ class UpstreamProviderError:
 
 
 def model_output_from_provider_error(
-    error: Exception, structured_output_requested: bool = False
+    error: Exception,
+    structured_output_requested: bool = False,
+    usage: Optional[Dict[str, int]] = None,
 ) -> ModelOutput:
     """Convert an SDK error to a sanitized, typed ``ModelOutput``."""
     if isinstance(
@@ -52,6 +54,7 @@ def model_output_from_provider_error(
         return ModelOutput(
             text=message,
             error_code=ErrorCode.VALIDATION_TYPE_ERROR.value,
+            usage=usage,
             model_context={
                 UPSTREAM_ERROR_CONTEXT_KEY: {
                     "kind": provider_error.kind,
@@ -71,6 +74,7 @@ def model_output_from_provider_error(
     return ModelOutput(
         text=message,
         error_code=error_code,
+        usage=usage,
         model_context={
             UPSTREAM_ERROR_CONTEXT_KEY: {
                 "kind": provider_error.kind,

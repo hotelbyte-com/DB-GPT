@@ -263,6 +263,7 @@ class ClaudeLLMClient(ProxyLLMClient):
         logger.info(
             f"Send request to claude, payload: {payload}\n\n messages:\n{messages}"
         )
+        usage = None
         try:
             if "max_tokens" not in payload:
                 max_tokens = 1024
@@ -274,7 +275,6 @@ class ClaudeLLMClient(ProxyLLMClient):
                 messages=messages,
                 **payload,
             )
-            usage = None
             finish_reason = response.stop_reason
             if response.usage:
                 usage = _anthropic_usage(response.usage)
@@ -294,7 +294,9 @@ class ClaudeLLMClient(ProxyLLMClient):
             )
         except Exception as e:
             return model_output_from_provider_error(
-                e, structured_output_requested=request.response_format is not None
+                e,
+                structured_output_requested=request.response_format is not None,
+                usage=usage,
             )
 
     async def generate_stream(
