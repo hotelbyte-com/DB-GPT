@@ -392,6 +392,72 @@ async def test_no_stream_chat_preserves_failed_model_output(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_no_stream_chat_returns_typed_structured_output_failure(monkeypatch):
+    failed_output = ModelOutput(
+        text="Upstream model provider returned invalid structured output.",
+        error_code=ErrorCode.VALIDATION_TYPE_ERROR.value,
+        model_context={
+            "upstream_error": {
+                "kind": "structured_output_invalid",
+                "status_code": None,
+            }
+        },
+    )
+
+    class CurrentMessage:
+        def add_ai_message(self, message):
+            assert message == ""
+
+        def add_view_message(self, message):
+            assert message == ""
+
+        def end_current_round(self):
+            pass
+
+    class ProviderChat:
+        current_message = CurrentMessage()
+        _executor = None
+        _no_streaming_call_with_retry = BaseChat._no_streaming_call_with_retry
+
+        async def _build_model_request(self):
+            return SimpleNamespace(to_dict=lambda: {}, span_id=None)
+
+        async def call_llm_operator(self, _payload):
+            return failed_output
+
+        async def _handle_final_output(self, _model_output):
+            raise AssertionError("failed provider output must not be post-processed")
+
+        def current_ai_response(self):
+            return ""
+
+        def message_adjust(self):
+            pass
+
+    async def call_immediately(_executor, func, *args):
+        return func(*args)
+
+    monkeypatch.setattr(base_chat, "blocking_func_to_async", call_immediately)
+
+    response, final_output = await BaseChat.nostream_call_with_output(ProviderChat())
+    assert response == ""
+    assert final_output is failed_output
+
+    request = SimpleNamespace(conv_uid="conv-1", model="test-model")
+
+    class Chat:
+        async def nostream_call_with_output(self):
+            return response, final_output
+
+    api_response = await no_stream_wrapper(request, Chat())
+    body = json.loads(api_response.body)
+
+    assert api_response.status_code == 502
+    assert body["error"]["type"] == "structured_output_error"
+    assert body["error"]["code"] == "structured_output_invalid"
+
+
+@pytest.mark.asyncio
 async def test_no_stream_chat_does_not_mask_post_processing_failure(monkeypatch):
     successful_output = ModelOutput.build("provider answered")
     response, final_output = await _run_no_stream_context_error(

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dbgpt.core import ModelMessage, ModelRequest
+from dbgpt.core import ModelInferenceMetrics, ModelMessage, ModelOutput, ModelRequest
 from dbgpt.core.schema.api import ErrorCode
 from dbgpt.model.cluster.worker.default_worker import DefaultModelWorker
 from dbgpt.model.proxy.llms.chatgpt import OpenAILLMClient
@@ -111,6 +111,38 @@ def test_worker_allows_declared_structured_output_provider_capability():
     worker.model = model
 
     worker._validate_response_format_support({"response_format": RESPONSE_FORMAT})
+
+
+def test_worker_preserves_typed_provider_error_context():
+    worker = object.__new__(DefaultModelWorker)
+    request_context = {"request_marker": "preserved"}
+    provider_output = ModelOutput(
+        text="Upstream model provider returned invalid structured output.",
+        error_code=ErrorCode.VALIDATION_TYPE_ERROR.value,
+        model_context={
+            "upstream_error": {
+                "kind": "structured_output_invalid",
+                "status_code": None,
+            }
+        },
+    )
+
+    output, _, _, _ = worker._handle_output(
+        provider_output,
+        previous_response="",
+        model_context=request_context,
+        last_metrics=ModelInferenceMetrics.create_metrics(),
+        is_first_generate=True,
+    )
+
+    assert output.model_context == {
+        "request_marker": "preserved",
+        "upstream_error": {
+            "kind": "structured_output_invalid",
+            "status_code": None,
+        },
+    }
+    assert request_context == {"request_marker": "preserved"}
 
 
 @pytest.mark.asyncio

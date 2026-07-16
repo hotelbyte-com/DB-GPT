@@ -593,6 +593,8 @@ class BaseChat(ABC):
     async def _no_streaming_call_with_retry(self, payload):
         with root_tracer.start_span("BaseChat.invoke_worker_manager.generate"):
             model_output = await self.call_llm_operator(payload)
+        if not model_output.success:
+            return "", "", model_output
         ai_response_text, view_message = await self._handle_final_output(model_output)
         return ai_response_text, view_message, model_output
 

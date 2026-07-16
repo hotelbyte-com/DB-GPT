@@ -524,7 +524,10 @@ class DefaultModelWorker(ModelWorker):
 
         metrics = _new_metrics_from_model_output(last_metrics, is_first_generate, usage)
         model_output.metrics = metrics
-        model_output.model_context = model_context
+        merged_model_context = dict(model_context or {})
+        if model_output.model_context:
+            merged_model_context.update(model_output.model_context)
+        model_output.model_context = merged_model_context
         return model_output, incremental_output, current_output, metrics
 
     def _handle_exception(self, e):
