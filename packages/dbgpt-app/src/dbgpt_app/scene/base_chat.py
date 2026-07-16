@@ -65,6 +65,7 @@ class ChatParam:
     app_code: str = ""
     temperature: Optional[float] = field(default=None)
     max_new_tokens: Optional[int] = field(default=None)
+    stream: Optional[bool] = field(default=None)
     message_version: str = "v2"
     model_cache_enable: bool = False
     prompt_code: Optional[str] = None
@@ -82,6 +83,12 @@ class ChatParam:
         return HumanMessage.parse_chat_completion_message(
             self.current_user_input, ignore_unknown_media=True
         )
+
+    def stream_mode(self, template_default: bool) -> bool:
+        """Resolve an explicit request stream flag before the scene default."""
+        if self.stream is None:
+            return template_default
+        return self.stream
 
 
 def _build_conversation(
@@ -358,8 +365,9 @@ class BaseChat(ABC):
         )
         self.current_message.tokens = 0
 
+        stream_mode = self._chat_param.stream_mode(self.prompt_template.stream_out)
         req_ctx = ModelRequestContext(
-            stream=self.prompt_template.stream_out,
+            stream=stream_mode,
             user_name=self._chat_param.user_name,
             sys_code=self._chat_param.sys_code,
             chat_mode=self.chat_mode.value(),
@@ -374,7 +382,7 @@ class BaseChat(ABC):
             memory=self.memory_config(),
             message_version=self._message_version,
             echo=self.llm_echo,
-            streaming=self.prompt_template.stream_out,
+            streaming=stream_mode,
             str_history=self.prompt_template.str_history,
             request_context=req_ctx,
         )
@@ -527,16 +535,24 @@ class BaseChat(ABC):
         )
 
     async def nostream_call(self):
+        response, _ = await self.nostream_call_with_output()
+        return response
+
+    async def nostream_call_with_output(self):
+        """Run the provider non-streaming path and retain its measured usage."""
         payload = await self._build_model_request()
         span = root_tracer.start_span(
             "BaseChat.nostream_call", metadata=payload.to_dict()
         )
         logger.info(f"Request: \n{payload}")
+        final_output: Optional[ModelOutput] = None
         payload.span_id = span.span_id
         try:
-            ai_response_text, view_message = await self._no_streaming_call_with_retry(
-                payload
-            )
+            (
+                ai_response_text,
+                view_message,
+                final_output,
+            ) = await self._no_streaming_call_with_retry(payload)
             self.current_message.add_ai_message(ai_response_text)
             self.current_message.add_view_message(view_message)
             self.message_adjust()
@@ -553,7 +569,7 @@ class BaseChat(ABC):
         await blocking_func_to_async(
             self._executor, self.current_message.end_current_round
         )
-        return self.current_ai_response()
+        return self.current_ai_response(), final_output
 
     @async_retry(
         retries=CFG.DBGPT_APP_SCENE_NON_STREAMING_RETRIES_BASE,
@@ -563,7 +579,8 @@ class BaseChat(ABC):
     async def _no_streaming_call_with_retry(self, payload):
         with root_tracer.start_span("BaseChat.invoke_worker_manager.generate"):
             model_output = await self.call_llm_operator(payload)
-        return await self._handle_final_output(model_output)
+        ai_response_text, view_message = await self._handle_final_output(model_output)
+        return ai_response_text, view_message, model_output
 
     async def _handle_final_output(
         self, final_output: ModelOutput, incremental: bool = False

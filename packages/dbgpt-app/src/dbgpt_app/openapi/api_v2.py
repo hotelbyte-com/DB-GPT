@@ -10,7 +10,6 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from dbgpt._private.pydantic import model_to_dict, model_to_json
 from dbgpt.component import SystemApp, logger
-from dbgpt.core import ModelOutput
 from dbgpt.core.schema.api import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -238,6 +237,7 @@ async def get_chat_instance(
         model_name=dialogue.model,
         temperature=dialogue.temperature,
         max_new_tokens=dialogue.max_new_tokens,
+        stream=dialogue.stream,
         chat_mode=ChatScene.of_mode(dialogue.chat_mode),
     )
     chat: BaseChat = await blocking_func_to_async(
@@ -260,13 +260,9 @@ async def no_stream_wrapper(
         chat (BaseChat): chat
     """
     with root_tracer.start_span("no_stream_generator"):
-        final_output: Optional[ModelOutput] = None
-        async for output in chat.stream_call(text_output=False, incremental=False):
-            if isinstance(output, ModelOutput):
-                final_output = output
+        response, final_output = await chat.nostream_call_with_output()
         if final_output is None:
             raise RuntimeError("model response did not include a final output")
-        response = final_output.text if final_output.has_text else ""
         msg = response.replace("\ufffd", "").replace("&quot;", '"')
         choice_data = ChatCompletionResponseChoice(
             index=0,
