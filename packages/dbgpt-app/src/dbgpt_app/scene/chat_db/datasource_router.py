@@ -67,6 +67,7 @@ def resolve_chat_data_source_with_evidence(
     system_app: SystemApp,
     *,
     contract: DataQueryContract,
+    user_id: Optional[str] = None,
     dao: Optional[ConnectConfigDao] = None,
     connector_manager: Optional[Any] = None,
 ) -> DatasourceResolution:
@@ -109,6 +110,16 @@ def resolve_chat_data_source_with_evidence(
     )
     required_columns = _required_source_columns(contract)
 
+    if not user_id:
+        return DatasourceResolution(
+            logical_group=logical_group,
+            status="group_unconfigured",
+            required_capabilities=required_capabilities,
+            required_columns=required_columns,
+            gap_kind="insufficient_scope",
+            reason="caller_identity_missing",
+        )
+
     if logical_group != contract.logical_group:
         return DatasourceResolution(
             logical_group=logical_group,
@@ -136,9 +147,21 @@ def resolve_chat_data_source_with_evidence(
 
         connector_manager = ConnectorManager.get_instance(system_app)
 
+    authorized_rows = dao.get_db_list(user_id=user_id)
+    authorized_by_name = {
+        str(row.get("db_name", "")): row
+        for row in authorized_rows
+        if str(row.get("db_name", ""))
+    }
+
     evidence: List[DatasourceCandidateEvidence] = []
     eligible: List[DatasourceCandidateEvidence] = []
+    authorization_denied = False
     for spec in sorted(specs, key=lambda item: (-item.priority, item.name)):
+        authorized_row = authorized_by_name.get(spec.name)
+        if authorized_row is None:
+            authorization_denied = True
+            continue
         configured_capabilities = _normalized_unique(spec.capabilities)
         missing = [
             capability
@@ -147,7 +170,9 @@ def resolve_chat_data_source_with_evidence(
         ]
         candidate = DatasourceCandidateEvidence(
             name=spec.name,
-            datasource_type=_datasource_type(spec.name, dao),
+            datasource_type=str(
+                authorized_row.get("db_type") or authorized_row.get("type") or ""
+            ),
             capabilities=configured_capabilities,
             priority=spec.priority,
             missing_capabilities=missing,
@@ -155,10 +180,6 @@ def resolve_chat_data_source_with_evidence(
         evidence.append(candidate)
         if missing:
             candidate.error = "capability_mismatch"
-            continue
-        if not dao.get_by_names(spec.name):
-            candidate.error = "datasource_not_registered"
-            eligible.append(candidate)
             continue
         try:
             connector = connector_manager.get_connector(spec.name)
@@ -211,6 +232,16 @@ def resolve_chat_data_source_with_evidence(
         candidate.healthy = True
         eligible.append(candidate)
 
+    if not evidence and authorization_denied:
+        return DatasourceResolution(
+            logical_group=logical_group,
+            status="group_unconfigured",
+            required_capabilities=required_capabilities,
+            required_columns=required_columns,
+            gap_kind="insufficient_scope",
+            reason="no_authorized_candidate",
+        )
+
     if not eligible:
         return DatasourceResolution(
             logical_group=logical_group,
@@ -251,6 +282,7 @@ def resolve_chat_data_source(
     user_input: str,
     system_app: SystemApp,
     hints: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Return the concrete datasource for a chat_data request.
 
@@ -276,32 +308,47 @@ def resolve_chat_data_source(
         return select_param
 
     dao = ConnectConfigDao()
-    candidates = _resolve_candidates(select_param, dao)
+    candidates = _resolve_candidates(select_param, dao, user_id=user_id)
+    if not candidates and user_id:
+        raise PermissionError("insufficient_scope")
     if len(candidates) <= 1:
         return candidates[0] if candidates else select_param
-    return _choose_candidate(candidates, user_input, system_app, dao, hints)
+    return _choose_candidate(
+        candidates,
+        user_input,
+        system_app,
+        dao,
+        hints,
+        user_id=user_id,
+    )
 
 
-def _resolve_candidates(select_param: str, dao: ConnectConfigDao) -> List[str]:
+def _resolve_candidates(
+    select_param: str,
+    dao: ConnectConfigDao,
+    user_id: Optional[str] = None,
+) -> List[str]:
     inline_candidates = _split_candidates(select_param)
     if len(inline_candidates) > 1:
-        return _existing_candidates(inline_candidates, dao) or inline_candidates
+        authorized = _existing_candidates(inline_candidates, dao, user_id=user_id)
+        return authorized if user_id else authorized or inline_candidates
 
     groups = _load_groups(os.environ.get(CHAT_DATA_GROUPS_ENV, ""))
     configured_candidates = groups.get(select_param, [])
     if configured_candidates:
-        return _existing_candidates(configured_candidates, dao) or configured_candidates
+        authorized = _existing_candidates(configured_candidates, dao, user_id=user_id)
+        return authorized if user_id else authorized or configured_candidates
 
     # HotelByte convention: expose one product-level chat_param while concrete
     # DB-GPT datasource names keep their physical DB names.
     if select_param == "hotel-be":
-        hotel_candidates = _hotel_be_default_candidates(dao)
+        hotel_candidates = _hotel_be_default_candidates(dao, user_id=user_id)
         if hotel_candidates:
             return hotel_candidates
 
-    if dao.get_by_names(select_param):
+    if _existing_candidates([select_param], dao, user_id=user_id):
         return [select_param]
-    return [select_param]
+    return [] if user_id else [select_param]
 
 
 def _load_groups(raw: str) -> Dict[str, List[str]]:
@@ -354,19 +401,6 @@ def _load_group_specs(raw: str) -> Dict[str, List[SourceCandidateSpec]]:
                 candidates.append(candidate)
         groups[str(name)] = candidates
     return groups
-
-
-def _datasource_type(candidate: str, dao: ConnectConfigDao) -> str:
-    try:
-        rows = dao.get_db_list(db_name=candidate)
-    except Exception:
-        return ""
-    if not rows:
-        return ""
-    row = rows[0]
-    if isinstance(row, dict):
-        return str(row.get("db_type") or row.get("type") or "")
-    return str(getattr(row, "db_type", "") or getattr(row, "type", ""))
 
 
 def _normalized_unique(values: Sequence[str]) -> List[str]:
@@ -437,12 +471,25 @@ def _split_candidates(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _existing_candidates(candidates: Sequence[str], dao: ConnectConfigDao) -> List[str]:
+def _existing_candidates(
+    candidates: Sequence[str],
+    dao: ConnectConfigDao,
+    user_id: Optional[str] = None,
+) -> List[str]:
+    if user_id:
+        authorized_names = {
+            str(row.get("db_name", ""))
+            for row in dao.get_db_list(user_id=user_id)
+            if str(row.get("db_name", ""))
+        }
+        return [candidate for candidate in candidates if candidate in authorized_names]
     return [candidate for candidate in candidates if dao.get_by_names(candidate)]
 
 
-def _hotel_be_default_candidates(dao: ConnectConfigDao) -> List[str]:
-    datasources = dao.get_db_list()
+def _hotel_be_default_candidates(
+    dao: ConnectConfigDao, user_id: Optional[str] = None
+) -> List[str]:
+    datasources = dao.get_db_list(user_id=user_id)
     # MySQL datasources keep their physical DB names ("hotel", "hotel_user", ...).
     hotel_names = [
         str(item.get("db_name", ""))
@@ -484,6 +531,7 @@ def _choose_candidate(
     system_app: SystemApp,
     dao: ConnectConfigDao,
     hints: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     from dbgpt_serve.datasource.manages import ConnectorManager
 
@@ -500,7 +548,7 @@ def _choose_candidate(
 
     scored = []
     for index, candidate in enumerate(candidates):
-        metadata = _datasource_metadata(candidate, dao)
+        metadata = _datasource_metadata(candidate, dao, user_id=user_id)
         tables = list(safe_tables(candidate))
         score = _score_candidate(candidate, metadata, tables, question, allowed_tables)
         scored.append((score, -index, candidate))
@@ -535,9 +583,11 @@ def _hint_tables(hints: Optional[Dict[str, Any]]) -> List[str]:
     return []
 
 
-def _datasource_metadata(candidate: str, dao: ConnectConfigDao) -> str:
+def _datasource_metadata(
+    candidate: str, dao: ConnectConfigDao, user_id: Optional[str] = None
+) -> str:
     try:
-        rows = dao.get_db_list(db_name=candidate)
+        rows = dao.get_db_list(db_name=candidate, user_id=user_id)
     except Exception:
         return candidate
     if not rows:

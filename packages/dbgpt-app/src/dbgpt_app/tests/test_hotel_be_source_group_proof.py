@@ -36,9 +36,12 @@ def _dao() -> MagicMock:
     dao.get_by_names.side_effect = (
         lambda name: [existing[name]] if name in existing else []
     )
-    dao.get_db_list.side_effect = lambda db_name=None: (
-        [existing[db_name]] if db_name in existing else list(existing.values())
-    )
+    dao.get_db_list.side_effect = lambda db_name=None, user_id=None: [
+        row
+        for name, row in existing.items()
+        if (not db_name or name == db_name)
+        and (not row.get("user_id") or row.get("user_id") == user_id)
+    ]
     return dao
 
 
@@ -116,6 +119,7 @@ def test_capability_contract_selects_tdengine_without_question_keyword_routing(
                 "ts",
             ],
         ),
+        user_id="alice",
         dao=_dao(),
         connector_manager=connector_manager,
     )
@@ -160,6 +164,7 @@ def test_missing_capability_returns_typed_gap_instead_of_mysql_fallback(monkeypa
         "Which hotelRates suppliers have the highest error rate?",
         system_app,
         contract=_contract("supplier_reliability", "time_series"),
+        user_id="alice",
         dao=_dao(),
         connector_manager=connector_manager,
     )
@@ -198,6 +203,7 @@ def test_empty_schema_is_not_reported_as_a_healthy_source(monkeypatch):
         "supplier reliability",
         system_app,
         contract=_contract("supplier_reliability", "time_series"),
+        user_id="alice",
         dao=_dao(),
         connector_manager=connector_manager,
     )
@@ -235,6 +241,7 @@ def test_missing_required_table_is_a_schema_gap(monkeypatch):
         contract=_contract(
             "supplier_reliability", "time_series", tables=["hblog_ns.hb_log"]
         ),
+        user_id="alice",
         dao=_dao(),
         connector_manager=connector_manager,
     )
@@ -277,6 +284,7 @@ def test_missing_required_column_is_a_schema_gap(monkeypatch):
             tables=["hb_log"],
             columns=["api_in_path", "api_out_supplier", "api_out_path"],
         ),
+        user_id="alice",
         dao=_dao(),
         connector_manager=connector_manager,
     )
@@ -284,3 +292,53 @@ def test_missing_required_column_is_a_schema_gap(monkeypatch):
     assert resolution.status == "schema_unavailable"
     assert resolution.candidates[0].error == "required_columns_missing"
     assert resolution.candidates[0].missing_columns == ["api_in_path", "api_out_path"]
+
+
+def test_governed_contract_never_inspects_another_users_datasource(monkeypatch):
+    monkeypatch.setenv(
+        "DBGPT_CHAT_DATA_GROUPS",
+        json.dumps(
+            {
+                "hotel-be": {
+                    "candidates": [
+                        {
+                            "name": "bob_tdengine",
+                            "capabilities": ["supplier_reliability", "time_series"],
+                            "priority": 100,
+                        }
+                    ]
+                }
+            }
+        ),
+    )
+    dao = MagicMock()
+    rows = [
+        {
+            "db_name": "bob_tdengine",
+            "db_type": "tdengine",
+            "user_id": "bob",
+        }
+    ]
+    dao.get_db_list.side_effect = lambda db_name=None, user_id=None: [
+        row
+        for row in rows
+        if (not db_name or row["db_name"] == db_name)
+        and (not row.get("user_id") or row.get("user_id") == user_id)
+    ]
+    connector_manager = MagicMock()
+
+    resolution = resolve_chat_data_source_with_evidence(
+        "hotel-be",
+        "supplier reliability",
+        MagicMock(),
+        contract=_contract("supplier_reliability", "time_series"),
+        user_id="alice",
+        dao=dao,
+        connector_manager=connector_manager,
+    )
+
+    assert resolution.status == "group_unconfigured"
+    assert resolution.gap_kind == "insufficient_scope"
+    assert resolution.reason == "no_authorized_candidate"
+    assert resolution.candidates == []
+    connector_manager.get_connector.assert_not_called()
