@@ -7,7 +7,14 @@
 
 import { MessagePart, ToolPart } from '@/new-components/chat/content/OpenCodeSessionTurn';
 import { ChatHistoryResponse } from '@/types/chat';
-import { ContextStatus, ReActSSEState, createReActSSEState, parseSSELine } from '@/utils/react-sse-parser';
+import type { AgentCitation } from '@/utils/react-agent-final';
+import {
+  ContextStatus,
+  ReActSSEState,
+  SSEQuestionAskedEvent,
+  createReActSSEState,
+  parseSSELine,
+} from '@/utils/react-sse-parser';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface ReActChatRequest {
@@ -26,6 +33,7 @@ export interface StreamingTurn {
   userMessage: string;
   parts: MessagePart[];
   finalContent: string;
+  citations: AgentCitation[];
   isWorking: boolean;
   startTime: number;
   endTime?: number;
@@ -45,12 +53,15 @@ export interface UseReActAgentChatReturn {
   streamingTurn: StreamingTurn | null;
   isStreaming: boolean;
   contextStatus: ContextStatus | null;
+  pendingQuestion: SSEQuestionAskedEvent | null;
   sendMessage: (
     request: ReActChatRequest,
     currentHistory: ChatHistoryResponse,
     order: number,
   ) => Promise<ChatHistoryResponse>;
   cancel: () => void;
+  replyQuestion: (requestId: string, answers: string[][]) => Promise<void>;
+  rejectQuestion: (requestId: string) => Promise<void>;
 }
 
 export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseReActAgentChatReturn {
@@ -59,17 +70,11 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
   const [streamingTurn, setStreamingTurn] = useState<StreamingTurn | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<SSEQuestionAskedEvent | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const sseStateRef = useRef<ReActSSEState | null>(null);
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      cancel();
-    };
-  }, []);
 
   const cancel = useCallback(() => {
     if (abortControllerRef.current) {
@@ -89,6 +94,13 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
     });
   }, []);
 
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      cancel();
+    };
+  }, [cancel]);
+
   const processSSELine = useCallback((line: string) => {
     if (!sseStateRef.current) return;
 
@@ -99,7 +111,8 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
 
     // Update streaming turn state
     const parts = sseStateRef.current.toMessageParts();
-    const finalContent = sseStateRef.current.getFinalContent();
+    const finalAnswer = sseStateRef.current.getFinalAnswer();
+    const finalContent = finalAnswer.content;
     const isWorking = sseStateRef.current.isWorking();
     const currentStatus = sseStateRef.current.getCurrentStatus();
 
@@ -113,12 +126,17 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
       setContextStatus(latestContextStatus);
     }
 
+    // Update pending question state
+    const latestQuestion = sseStateRef.current.getPendingQuestion();
+    setPendingQuestion(latestQuestion);
+
     setStreamingTurn(prev => {
       if (!prev) return null;
       return {
         ...prev,
         parts,
         finalContent,
+        citations: finalAnswer.citations,
         isWorking,
         currentStatus,
         thinkingContent,
@@ -152,6 +170,7 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
         userMessage,
         parts: [],
         finalContent: '',
+        citations: [],
         isWorking: true,
         startTime,
         currentStatus: 'Starting...',
@@ -205,7 +224,7 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
         const decoder = new TextDecoder();
         let buffer = '';
 
-        while (true) {
+        for (;;) {
           const { done, value } = await reader.read();
 
           if (done) {
@@ -238,13 +257,23 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
 
         // Get final state
         const finalParts = sseStateRef.current?.toMessageParts() || [];
-        const finalContent = sseStateRef.current?.getFinalContent() || '';
+        const finalAnswer = sseStateRef.current?.getFinalAnswer() || { content: '', citations: [] };
+        const finalContent = finalAnswer.content;
 
         // Format final response for history
         // Combine tool parts and final content into a structured response
         const formattedResponse = formatReActResponse(finalParts, finalContent);
 
         // Update final history
+        const finalViewMessage: ChatHistoryResponse[number] = {
+          role: 'view',
+          context: formattedResponse,
+          model_name: request.model_name || '',
+          order: order,
+          time_stamp: Date.now(),
+          thinking: false,
+          citations: finalAnswer.citations,
+        };
         const finalHistory: ChatHistoryResponse = [
           ...currentHistory,
           {
@@ -254,14 +283,7 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
             order: order,
             time_stamp: startTime,
           },
-          {
-            role: 'view',
-            context: formattedResponse,
-            model_name: request.model_name || '',
-            order: order,
-            time_stamp: Date.now(),
-            thinking: false,
-          },
+          finalViewMessage,
         ];
 
         // Clear streaming turn after a brief delay
@@ -329,12 +351,41 @@ export function useReActAgentChat(options: UseReActAgentChatOptions = {}): UseRe
     [baseUrl, cancel, processSSELine, onHistoryUpdate, onError, onComplete],
   );
 
+  const replyQuestion = useCallback(async (requestId: string, answers: string[][]) => {
+    try {
+      const res = await fetch(`/api/v1/chat/question/${requestId}/reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setPendingQuestion(null);
+    } catch (e) {
+      console.error('replyQuestion failed:', e);
+    }
+  }, []);
+
+  const rejectQuestion = useCallback(async (requestId: string) => {
+    try {
+      const res = await fetch(`/api/v1/chat/question/${requestId}/reject`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setPendingQuestion(null);
+    } catch (e) {
+      console.error('rejectQuestion failed:', e);
+    }
+  }, []);
+
   return {
     streamingTurn,
     isStreaming,
     contextStatus,
+    pendingQuestion,
     sendMessage,
     cancel,
+    replyQuestion,
+    rejectQuestion,
   };
 }
 
@@ -351,14 +402,11 @@ function formatReActResponse(parts: MessagePart[], finalContent: string): string
 
   // Format as ReAct-style text that can be parsed later
   let formatted = '';
-  let stepNum = 0;
-
   for (const part of parts) {
     if (part.type === 'reasoning') {
       formatted += `Thought: ${(part as any).text}\n`;
     } else if (part.type === 'tool') {
       const tool = part as ToolPart;
-      stepNum++;
       const action = tool.state.metadata?.action || tool.tool;
       formatted += `Action: ${action}\n`;
       if (tool.state.input) {

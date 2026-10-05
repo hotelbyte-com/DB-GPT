@@ -23,12 +23,16 @@ class KnowledgeSpaceRequest(BaseModel):
     name: Optional[str] = None
     """vector_type: vector type"""
     vector_type: Optional[str] = None
+    """index_methods: index methods (multi-select)"""
+    index_methods: Optional[List[str]] = None
     """vector_type: vector type"""
     domain_type: str = "Normal"
     """desc: description"""
     desc: str = None
     """owner: owner"""
     owner: Optional[str] = None
+    """context: space-level JSON config (embedding params, wiki_config, ...)"""
+    context: Optional[dict] = None
 
     space_id: Optional[Union[int, str]] = None
 
@@ -37,6 +41,7 @@ class BusinessFieldType(Enum):
     """BusinessFieldType"""
 
     NORMAL = "Normal"
+    GIT_REPO = "GitRepo"
 
 
 class KnowledgeDocumentRequest(BaseModel):

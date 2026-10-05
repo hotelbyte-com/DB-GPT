@@ -474,7 +474,7 @@
   transition: transform var(--transition-fast);
 }
 
-.oc-collapsible[data-state="open"] .oc-collapsible-arrow {
+.oc-collapsible-arrow[data-state="open"] {
   transform: rotate(180deg);
 }
 
@@ -734,6 +734,30 @@
   height: 100%;
   overflow-y: auto;
   padding: 1rem 0.5rem;
+}
+
+/* models-config page: let the tabpane chain fill the viewport height so the
+   provider list / detail pane can scroll independently. antd v5 top tabs are
+   display:block with auto height, so the flex chain must start at .ant-tabs. */
+.ant-tabs.models-config-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ant-tabs.models-config-tabs > .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+}
+
+.ant-tabs.models-config-tabs .ant-tabs-content,
+.ant-tabs.models-config-tabs .ant-tabs-tabpane {
+  height: 100%;
+}
+
+.ant-tabs.models-config-tabs .ant-tabs-tabpane {
+  overflow: hidden;
 }
 
 /* Streaming cursor animation */
@@ -2187,4 +2211,3 @@
   transform: translateX(2px);
   transition: transform 0.15s ease;
 }
-

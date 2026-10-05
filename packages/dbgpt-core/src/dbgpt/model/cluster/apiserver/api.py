@@ -50,7 +50,7 @@ from dbgpt.model.cluster.manager_base import WorkerManager, WorkerManagerFactory
 from dbgpt.model.cluster.registry import ModelRegistry
 from dbgpt.model.parameter import ModelAPIServerParameters, WorkerType
 from dbgpt.util.chat_util import transform_to_sse
-from dbgpt.util.fastapi import create_app
+from dbgpt.util.fastapi import build_cors_config, create_app
 from dbgpt.util.tracer import initialize_tracer, root_tracer, trace
 from dbgpt.util.tracer.tracer_impl import TracerParameters
 from dbgpt.util.utils import (
@@ -60,6 +60,38 @@ from dbgpt.util.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_span_metadata(
+    model_name: str,
+    last_usage: "UsageInfo",
+    curr_usage: "UsageInfo",
+    full_text: str,
+    status: str = "OK",
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build rich span metadata for an LLM call.
+
+    ``Span.end(metadata=...)`` *replaces* the start metadata, so this must carry
+    everything the observability store indexes (model / tokens / status), not just
+    the output text.
+    """
+    prompt = int((last_usage.prompt_tokens or 0) + (curr_usage.prompt_tokens or 0))
+    completion = int(
+        (last_usage.completion_tokens or 0) + (curr_usage.completion_tokens or 0)
+    )
+    total = int((last_usage.total_tokens or 0) + (curr_usage.total_tokens or 0))
+    meta: Dict[str, Any] = {
+        "model_name": model_name,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "status": status,
+        "full_text": full_text,
+    }
+    if error:
+        meta["error"] = error
+    return meta
 
 
 class APIServerException(Exception):
@@ -341,6 +373,16 @@ class APIServer(BaseComponent):
             async for model_output in worker_manager.generate_stream(params):
                 model_output: ModelOutput = model_output
                 if model_output.error_code != 0:
+                    span.end(
+                        metadata=_llm_span_metadata(
+                            model_name,
+                            last_usage,
+                            curr_usage,
+                            full_text,
+                            status="ERROR",
+                            error=model_output.text,
+                        )
+                    )
                     yield transform_to_sse(model_output.to_dict())
                     yield transform_to_sse("[DONE]")
                     return
@@ -398,9 +440,9 @@ class APIServer(BaseComponent):
 
                 yield transform_to_sse(chunk)
             span.end(
-                metadata={
-                    "full_text": full_text,
-                }
+                metadata=_llm_span_metadata(
+                    model_name, last_usage, curr_usage, full_text, status="OK"
+                )
             )
 
         # There is not "content" field in the last delta message, so exclude_none to
@@ -428,11 +470,19 @@ class APIServer(BaseComponent):
         try:
             all_tasks = await asyncio.gather(*chat_completions)
         except Exception as e:
+            span = root_tracer.get_current_span()
+            if span is not None:
+                span.metadata.update({"status": "ERROR", "error": str(e)})
             return create_error_response(ErrorCode.INTERNAL_ERROR, str(e))
         usage = UsageInfo()
         for i, model_output in enumerate(all_tasks):
             model_output: ModelOutput = model_output
             if model_output.error_code != 0:
+                span = root_tracer.get_current_span()
+                if span is not None:
+                    span.metadata.update(
+                        {"status": "ERROR", "error": model_output.text}
+                    )
                 return create_error_response(model_output.error_code, model_output.text)
             choices.append(
                 ChatCompletionResponseChoice(
@@ -450,6 +500,16 @@ class APIServer(BaseComponent):
                 for usage_key, usage_value in model_to_dict(task_usage).items():
                     setattr(usage, usage_key, getattr(usage, usage_key) + usage_value)
 
+        span = root_tracer.get_current_span()
+        if span is not None:
+            span.metadata.update(
+                {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "status": "OK",
+                }
+            )
         return ChatCompletionResponse(model=model_name, choices=choices, usage=usage)
 
     async def completion_stream_generator(
@@ -543,6 +603,11 @@ class APIServer(BaseComponent):
         for i, model_output in enumerate(all_tasks):
             model_output: ModelOutput = model_output
             if model_output.error_code != 0:
+                span = root_tracer.get_current_span()
+                if span is not None:
+                    span.metadata.update(
+                        {"status": "ERROR", "error": model_output.text}
+                    )
                 return create_error_response(model_output.error_code, model_output.text)
             choices.append(
                 CompletionResponseChoice(
@@ -899,10 +964,7 @@ def initialize_apiserver(
         # https://github.com/encode/starlette/issues/617
         cors_app = CORSMiddleware(
             app=app,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["*"],
+            **build_cors_config(apiserver_params.cors_allowed_origins),
         )
         log_level = "info"
         if log_config:

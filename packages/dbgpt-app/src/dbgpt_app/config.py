@@ -1,3 +1,5 @@
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -8,6 +10,7 @@ from dbgpt.model.parameter import (
     ModelServiceConfig,
 )
 from dbgpt.storage.cache.manager import ModelCacheParameters
+from dbgpt.storage.vector_store.base import VectorStoreConfig
 from dbgpt.util.configure import HookConfig
 from dbgpt.util.i18n_utils import _
 from dbgpt.util.parameter_utils import BaseParameters
@@ -19,6 +22,11 @@ from dbgpt_ext.storage.vector_store.chroma_store import ChromaVectorConfig
 from dbgpt_ext.storage.vector_store.elastic_store import ElasticsearchStoreConfig
 from dbgpt_serve.core import BaseServeConfig
 from dbgpt_serve.core.config import GPTsAppConfig
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_PARALLEL_SUBAGENTS = 3
+_MAX_PARALLEL_SUBAGENTS_ENV_VAR = "DBGPT_MAX_PARALLEL_SUBAGENTS"
 
 
 @dataclass
@@ -55,7 +63,7 @@ class SystemParameters:
 class StorageConfig(BaseParameters):
     __cfg_type__ = "app"
 
-    vector: Optional[ChromaVectorConfig] = field(
+    vector: Optional[VectorStoreConfig] = field(
         default_factory=lambda: ChromaVectorConfig(),
         metadata={
             "help": _("default vector type"),
@@ -76,10 +84,58 @@ class StorageConfig(BaseParameters):
 
 
 @dataclass
+class KnowledgeSourceParameters(BaseParameters):
+    """External knowledge source framework configuration."""
+
+    encrypt_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": _(
+                "AES-256 master key for encrypting knowledge source "
+                "credentials at rest (falls back to env "
+                "DB_GPT_KS_ENCRYPT_KEY)"
+            )
+        },
+    )
+    extra_connector_modules: Optional[List[str]] = field(
+        default_factory=list,
+        metadata={
+            "help": _(
+                "Python modules to import at startup for self-registering "
+                "community knowledge-source connectors"
+            )
+        },
+    )
+    ca_bundle: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": _(
+                "CA bundle path for platform HTTP calls (corporate TLS-"
+                "intercepting proxies; env DB_GPT_KS_CA_BUNDLE)"
+            )
+        },
+    )
+    insecure_tls: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": _(
+                "DISABLE TLS verification for platform calls (env "
+                "DB_GPT_KS_INSECURE). Last resort only."
+            )
+        },
+    )
+
+
+@dataclass
 class RagParameters(BaseParameters):
     """Rag configuration."""
 
     __cfg_type__ = "app"
+
+    knowledge_source: KnowledgeSourceParameters = field(
+        default_factory=lambda: KnowledgeSourceParameters(),
+        metadata={"help": _("External knowledge source configuration")},
+    )
 
     chunk_size: Optional[int] = field(
         default=500,
@@ -255,10 +311,51 @@ class AgentContextParameters(BaseParameters):
         default=3,
         metadata={"help": _("Consecutive compaction failures before circuit break")},
     )
+    max_parallel_subagents: int = field(
+        default=_DEFAULT_MAX_PARALLEL_SUBAGENTS,
+        metadata={
+            "help": _(
+                "Max concurrent sub-agents per dispatch_parallel_tasks call. "
+                "Higher values fan out more sub-tasks at once but multiply "
+                "token cost. The DBGPT_MAX_PARALLEL_SUBAGENTS environment "
+                "variable overrides this value."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.max_context_tokens is None or self.max_context_tokens <= 0:
             self.max_context_tokens = DEFAULT_MAX_CONTEXT_TOKENS
+
+        env_value = os.getenv(_MAX_PARALLEL_SUBAGENTS_ENV_VAR)
+        if env_value is not None:
+            try:
+                parsed_env_value = int(env_value)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid %s=%r; using configured value %s",
+                    _MAX_PARALLEL_SUBAGENTS_ENV_VAR,
+                    env_value,
+                    self.max_parallel_subagents,
+                )
+            else:
+                if parsed_env_value > 0:
+                    self.max_parallel_subagents = parsed_env_value
+                else:
+                    logger.warning(
+                        "Ignoring non-positive %s=%r; using configured value %s",
+                        _MAX_PARALLEL_SUBAGENTS_ENV_VAR,
+                        env_value,
+                        self.max_parallel_subagents,
+                    )
+
+        if self.max_parallel_subagents <= 0:
+            logger.warning(
+                "Invalid max_parallel_subagents=%s; using default %s",
+                self.max_parallel_subagents,
+                _DEFAULT_MAX_PARALLEL_SUBAGENTS,
+            )
+            self.max_parallel_subagents = _DEFAULT_MAX_PARALLEL_SUBAGENTS
 
 
 @dataclass
@@ -377,6 +474,17 @@ class ServiceWebParameters(BaseParameters):
     agent_context: AgentContextParameters = field(
         default_factory=AgentContextParameters,
         metadata={"help": _("Agent context-window management configuration")},
+    )
+    cors_allowed_origins: str = field(
+        default="*",
+        metadata={
+            "help": _(
+                "Comma-separated allowed CORS origins. Default '*' allows all "
+                "(any website can read API responses cross-origin). Set to "
+                "explicit origins to restrict, e.g. "
+                "http://localhost:3000,https://your-app.com."
+            )
+        },
     )
 
 

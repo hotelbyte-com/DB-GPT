@@ -10,11 +10,12 @@
  * - step.meta: Step metadata { type, id, thought, action, action_input }
  * - step.done: Step completed { type, id, status }
  * - context.status: Context budget status { type, used, budget, ratio, state, compact_layer }
- * - final: Final answer { type, content }
+ * - final: Final answer { type, protocol_version, content, citations }
  * - done: Stream completed { type }
  */
 
 import { MessagePart, ReasoningPart, ToolPart, ToolStatus } from '@/new-components/chat/content/OpenCodeSessionTurn';
+import { AgentCitation, AgentFinalAnswer, decodeFinalEvent } from '@/utils/react-agent-final';
 
 // SSE Event Types
 export interface SSEStepStartEvent {
@@ -38,6 +39,8 @@ export interface SSEStepMetaEvent {
   thought?: string;
   action?: string;
   action_input?: any;
+  action_intention?: string;
+  action_reason?: string;
 }
 
 export interface SSEStepThoughtEvent {
@@ -56,6 +59,14 @@ export interface SSEFinalEvent {
   type: 'final';
   content: string;
   status?: 'success';
+  protocol_version?: number;
+  citations?: unknown[];
+}
+
+export interface SSETaskPreviewEvent {
+  type: 'task.preview';
+  content: string;
+  round?: number;
 }
 
 export interface SSEDoneEvent {
@@ -81,6 +92,38 @@ export interface SSEContextStatusEvent {
   compact_layer?: string | null;
 }
 
+// ── Human-in-the-loop: question events ──────────────────────────────────────
+
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface QuestionInfo {
+  question: string;
+  header: string;
+  options: QuestionOption[];
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface SSEQuestionAskedEvent {
+  type: 'question.asked';
+  request_id: string;
+  conv_id: string;
+  questions: QuestionInfo[];
+}
+
+export interface SSEQuestionRepliedEvent {
+  type: 'question.replied';
+  request_id: string;
+}
+
+export interface SSEQuestionRejectedEvent {
+  type: 'question.rejected';
+  request_id: string;
+}
+
 export type SSEEvent =
   | SSEStepStartEvent
   | SSEStepChunkEvent
@@ -88,8 +131,12 @@ export type SSEEvent =
   | SSEStepThoughtEvent
   | SSEStepDoneEvent
   | SSEContextStatusEvent
+  | SSEQuestionAskedEvent
+  | SSEQuestionRepliedEvent
+  | SSEQuestionRejectedEvent
   | SSEFinalEvent
   | SSEErrorEvent
+  | SSETaskPreviewEvent
   | SSEDoneEvent;
 
 // Internal state for tracking context budget
@@ -109,6 +156,8 @@ interface StepState {
   thought?: string;
   action?: string;
   actionInput?: any;
+  actionIntention?: string;
+  actionReason?: string;
   output: string[];
   error?: string;
 }
@@ -120,11 +169,13 @@ interface StepState {
 export class ReActSSEState {
   private steps: Map<string, StepState> = new Map();
   private stepOrder: string[] = [];
-  private finalContent: string = '';
+  private finalAnswer: AgentFinalAnswer = { content: '', citations: [] };
   private isDone: boolean = false;
   private startTime: number;
   private endTime?: number;
   private _contextStatus: ContextStatus | null = null;
+  private _pendingQuestion: SSEQuestionAskedEvent | null = null;
+  private _taskPreview: string | null = null;
 
   constructor() {
     this.startTime = Date.now();
@@ -153,11 +204,22 @@ export class ReActSSEState {
       case 'context.status':
         this.handleContextStatus(event);
         break;
+      case 'question.asked':
+        this._pendingQuestion = event;
+        break;
+      case 'question.replied':
+      case 'question.rejected':
+        this._pendingQuestion = null;
+        break;
       case 'final':
         this.handleFinal(event);
         break;
       case 'error':
         this.handleError(event);
+      case 'task.preview':
+        if (!this._taskPreview) {
+          this._taskPreview = event.content;
+        }
         break;
       case 'done':
         this.handleDone(event);
@@ -165,7 +227,21 @@ export class ReActSSEState {
     }
   }
 
+  /**
+   * Get the current pending question (null if none)
+   */
+  getPendingQuestion(): SSEQuestionAskedEvent | null {
+    return this._pendingQuestion;
+  }
+
   private handleStepStart(event: SSEStepStartEvent): void {
+    const existing = this.steps.get(event.id);
+    if (existing) {
+      // Backend sends two step.start for the same id ("思考中" + real title).
+      // Update tool name but don't duplicate in stepOrder.
+      existing.tool = this.mapTitleToTool(event.title);
+      return;
+    }
     const step: StepState = {
       id: event.id,
       tool: this.mapTitleToTool(event.title),
@@ -202,6 +278,8 @@ export class ReActSSEState {
     if (event.action_input !== undefined) {
       step.actionInput = event.action_input;
     }
+    if (event.action_intention) step.actionIntention = event.action_intention;
+    if (event.action_reason) step.actionReason = event.action_reason;
   }
 
   private handleStepThought(event: SSEStepThoughtEvent): void {
@@ -221,7 +299,7 @@ export class ReActSSEState {
   }
 
   private handleFinal(event: SSEFinalEvent): void {
-    this.finalContent = event.content;
+    this.finalAnswer = decodeFinalEvent(event);
   }
 
   private handleError(event: SSEErrorEvent): void {
@@ -285,6 +363,11 @@ export class ReActSSEState {
     if (lowerTitle.includes('terminate')) return 'task';
     if (lowerTitle.includes('react round')) return 'task';
 
+    // Knowledge base tools — keep the action name as the tool type
+    if (lowerTitle.startsWith('kb_') || lowerTitle.startsWith('semantic_search')) {
+      return lowerTitle;
+    }
+
     return 'task'; // Default tool
   }
 
@@ -293,6 +376,12 @@ export class ReActSSEState {
    */
   private mapActionToTool(action: string): string {
     const lowerAction = action.toLowerCase();
+
+    // Knowledge base tools — keep the action name as the tool type so the
+    // frontend can render the real tool name (kb_ls, kb_grep, kb_cat, ...).
+    if (lowerAction.startsWith('kb_') || lowerAction === 'semantic_search') {
+      return lowerAction;
+    }
 
     // Map common actions to OpenCode tool types
     const actionMap: Record<string, string> = {
@@ -331,8 +420,8 @@ export class ReActSSEState {
       // Skip terminate action — its output is shown as finalContent, not as a step card
       if (step.action && step.action.toLowerCase() === 'terminate') {
         // If terminate has output and we don't yet have finalContent, use it
-        if (!this.finalContent && step.output.length > 0) {
-          this.finalContent = step.output.join('\n');
+        if (!this.finalAnswer.content && step.output.length > 0) {
+          this.finalAnswer = decodeFinalEvent(step.output.join('\n'));
         }
         continue;
       }
@@ -360,7 +449,14 @@ export class ReActSSEState {
             : undefined,
           output: step.output.length > 0 ? step.output.join('\n') : undefined,
           error: step.error,
-          metadata: step.action ? { action: step.action } : undefined,
+          metadata:
+            step.action || step.actionIntention
+              ? {
+                  action: step.action,
+                  intention: step.actionIntention,
+                  reason: step.actionReason,
+                }
+              : undefined,
         },
       };
       parts.push(toolPart);
@@ -373,7 +469,27 @@ export class ReActSSEState {
    * Get final assistant message
    */
   getFinalContent(): string {
-    return this.finalContent;
+    return this.finalAnswer.content;
+  }
+
+  /** Get the canonical final answer, including structured citations. */
+  getFinalAnswer(): AgentFinalAnswer {
+    return {
+      content: this.finalAnswer.content,
+      citations: [...this.finalAnswer.citations],
+    };
+  }
+
+  /** Get structured citations attached to the final answer. */
+  getCitations(): AgentCitation[] {
+    return [...this.finalAnswer.citations];
+  }
+
+  /**
+   * Get the one-time task preview ("Plan: ...") if the model emitted one.
+   */
+  getTaskPreview(): string | null {
+    return this._taskPreview;
   }
 
   /**

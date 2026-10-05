@@ -1,6 +1,8 @@
+import { AttachmentMessageCards, type SessionFileSnapshot } from '@/modules/session-files';
 import MarkdownContext from '@/new-components/common/MarkdownContext';
 import { AttachedConnector } from '@/new-components/connector/types';
 import {
+  ApartmentOutlined,
   ApiOutlined,
   AppstoreOutlined,
   BarChartOutlined,
@@ -28,6 +30,7 @@ import {
   LoadingOutlined,
   PlayCircleOutlined,
   PlusOutlined,
+  QuestionCircleOutlined,
   SearchOutlined,
   TableOutlined,
 } from '@ant-design/icons';
@@ -52,6 +55,9 @@ export type StepType =
   | 'python'
   | 'html'
   | 'sql'
+  | 'question'
+  | 'kb'
+  | 'code_graph'
   | 'other';
 
 export interface ExecutionStep {
@@ -63,6 +69,10 @@ export interface ExecutionStep {
   phase?: string;
   status: StepStatus;
   output?: any;
+  /** Raw confirmed tool action, used for action-specific compact timeline cards. */
+  action?: string;
+  /** Confirmed tool input. Only compact, non-sensitive fields are rendered. */
+  actionInput?: unknown;
   todoMeta?: {
     state?: 'init' | 'progress' | 'done';
     done?: number;
@@ -97,8 +107,12 @@ export interface ManusLeftPanelProps {
   isWorking?: boolean;
   userQuery?: string;
   assistantText?: string;
+  /** Render incremental answer text without reparsing Markdown on every frame. */
+  isAssistantStreaming?: boolean;
   modelName?: string;
   stepThoughts?: Record<string, string>;
+  /** Optional slot rendered above the execution sections (sub-agent card). */
+  subAgentSlot?: React.ReactNode;
   artifacts?: ArtifactItem[];
   onArtifactClick?: (artifact: ArtifactItem) => void;
   onArtifactDownload?: (artifact: ArtifactItem) => void;
@@ -106,11 +120,11 @@ export interface ManusLeftPanelProps {
   onShare?: () => void;
   isCollapsed?: boolean;
   onExpand?: () => void;
-  attachedFile?: {
-    name: string;
-    size: number;
-    type: string;
-  };
+  /**
+   * Immutable display snapshots of every file attached to this message
+   * (session snapshots, or legacy attachments via `snapshotFromLegacyFile`).
+   */
+  attachedFiles?: readonly SessionFileSnapshot[];
   attachedKnowledge?: {
     id: number;
     name: string;
@@ -131,6 +145,10 @@ export interface ManusLeftPanelProps {
   onSkillCardClick?: (skillName: string) => void;
   onSkillDownload?: (skillName: string) => void;
   taskPlan?: TaskItem[];
+  /** Citation indexes that are valid for this answer. */
+  citationIndexes?: number[];
+  /** Open the references panel from the answer footer. */
+  onReferencesClick?: () => void;
 }
 
 // Get step icon based on type and status
@@ -159,8 +177,14 @@ const getStepIcon = (type: StepType, status: StepStatus) => {
     case 'task':
     case 'skill':
       return <PlayCircleOutlined className={classNames(iconClass, 'text-indigo-500')} />;
+    case 'question':
+      return <QuestionCircleOutlined className={classNames(iconClass, 'text-amber-500')} />;
     case 'sql':
       return <ConsoleSqlOutlined className={classNames(iconClass, 'text-emerald-600')} />;
+    case 'kb':
+      return <FolderOpenOutlined className={classNames(iconClass, 'text-teal-500')} />;
+    case 'code_graph':
+      return <ApartmentOutlined className={classNames(iconClass, 'text-violet-500')} />;
     default:
       return <FileTextOutlined className={classNames(iconClass, 'text-gray-500')} />;
   }
@@ -179,6 +203,9 @@ const getTypeLabel = (type: StepType, t: any): string => {
     sql: t('step_type_sql'),
     python: t('step_type_python'),
     html: t('step_type_html'),
+    question: t('step_type_question') || 'Ask User',
+    kb: t('step_type_kb') || 'Knowledge',
+    code_graph: t('step_type_code_graph') || 'Code Graph',
     other: t('step_type_other'),
   };
   return labels[type] || t('step_type_other');
@@ -198,6 +225,9 @@ const getIconBgClass = (type: StepType): string => {
     task: 'bg-indigo-50 dark:bg-indigo-900/30',
     skill: 'bg-indigo-50 dark:bg-indigo-900/30',
     sql: 'bg-emerald-50 dark:bg-emerald-900/30',
+    question: 'bg-amber-50 dark:bg-amber-900/30',
+    kb: 'bg-teal-50 dark:bg-teal-900/30',
+    code_graph: 'bg-violet-50 dark:bg-violet-900/30',
     other: 'bg-gray-50 dark:bg-gray-800',
   };
   return bgClasses[type] || 'bg-gray-50 dark:bg-gray-800';
@@ -207,19 +237,6 @@ const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-};
-
-const getFileTypeLabel = (fileName: string, t: any, mimeType?: string): string => {
-  const ext = fileName.toLowerCase().split('.').pop() || '';
-  if (['xlsx', 'xls'].includes(ext) || mimeType?.includes('spreadsheet') || mimeType?.includes('excel'))
-    return t('file_type_spreadsheet');
-  if (ext === 'csv' || mimeType?.includes('csv')) return t('file_type_spreadsheet');
-  if (ext === 'pdf' || mimeType?.includes('pdf')) return t('file_type_pdf');
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext) || mimeType?.includes('image'))
-    return t('file_type_image');
-  if (['doc', 'docx'].includes(ext) || mimeType?.includes('word')) return t('file_type_word');
-  if (['txt', 'md'].includes(ext) || mimeType?.includes('text')) return t('file_type_text');
-  return t('file_type_generic');
 };
 
 const getFileIconElement = (fileName: string, mimeType?: string) => {
@@ -492,7 +509,8 @@ const StepCard: React.FC<{
   step: ExecutionStep;
   isActive: boolean;
   onClick: () => void;
-}> = memo(({ step, isActive, onClick }) => {
+  thought?: string;
+}> = memo(({ step, isActive, onClick, thought }) => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
   const detailLine = step.description ? step.description.split('\n')[0] : '';
@@ -528,6 +546,60 @@ const StepCard: React.FC<{
           <span className='relative inline-flex rounded-full h-2.5 w-2.5 bg-gradient-to-r from-blue-400 to-cyan-400' />
         </span>
         <span className='text-sm text-gray-700 dark:text-gray-300'>{t('thinking')}</span>
+      </div>
+    );
+  }
+  const isQuestionStep = step.type === 'question' || step.title === 'question';
+  if (isQuestionStep) {
+    const isWaiting = step.status === 'running';
+    return (
+      <div
+        onClick={onClick}
+        className={classNames(
+          'group relative cursor-pointer rounded-lg border transition-all duration-200',
+          'px-3 py-2.5',
+          'transform',
+          {
+            'opacity-0 translate-y-1': !isVisible,
+            'opacity-100 translate-y-0': isVisible,
+            'bg-gradient-to-r from-amber-50/80 via-orange-50/50 to-white dark:from-amber-900/20 dark:via-orange-900/10 dark:to-[#1a1b1e]':
+              true,
+            'border-amber-300/80 dark:border-amber-500/30 shadow-[0_4px_16px_rgba(245,158,11,0.12)] ring-1 ring-amber-200/50 dark:ring-amber-500/20':
+              isActive || isWaiting,
+            'border-amber-200/60 dark:border-amber-600/20 hover:border-amber-300 hover:shadow-[0_4px_12px_rgba(245,158,11,0.08)]':
+              !isActive && !isWaiting,
+          },
+        )}
+        style={{ transition: 'opacity 0.2s ease-out, transform 0.2s ease-out' }}
+      >
+        {isWaiting && (
+          <div className='absolute left-0 top-2 bottom-2 w-[3px] rounded-r-full bg-gradient-to-b from-amber-400 to-orange-400 animate-pulse' />
+        )}
+        <div className='flex items-center gap-3'>
+          <div className='flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-amber-100 to-orange-100 shadow-sm ring-1 ring-amber-200/80 dark:from-amber-500/15 dark:to-orange-500/15 dark:ring-amber-400/30'>
+            <QuestionCircleOutlined className='text-[13px] text-amber-600 dark:text-amber-400' />
+          </div>
+          <div className='flex flex-col min-w-0 flex-1'>
+            <span className='text-[10px] font-semibold uppercase tracking-wider text-amber-600/80 dark:text-amber-400/80'>
+              {isWaiting ? t('waiting_for_user') || 'Waiting for User' : t('step_type_question') || 'Ask User'}
+            </span>
+            <span className='text-sm font-medium text-slate-800 dark:text-slate-200 truncate'>
+              {step.title === 'question' ? t('user_confirmation') || '需要您的确认' : step.title}
+            </span>
+          </div>
+          <div className='flex-shrink-0'>
+            {isWaiting ? (
+              <span className='relative flex h-3 w-3'>
+                <span className='animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60' />
+                <span className='relative inline-flex rounded-full h-3 w-3 bg-amber-500' />
+              </span>
+            ) : step.status === 'completed' ? (
+              <CheckCircleOutlined className='text-xs text-emerald-500' />
+            ) : step.status === 'error' ? (
+              <ExclamationCircleOutlined className='text-xs text-red-500' />
+            ) : null}
+          </div>
+        </div>
       </div>
     );
   }
@@ -637,7 +709,7 @@ const StepCard: React.FC<{
           'text-purple-600 dark:text-purple-400': step.type === 'bash',
           'text-cyan-600 dark:text-cyan-400': step.type === 'grep' || step.type === 'glob',
           'text-blue-600 dark:text-blue-400': step.type === 'python',
-          'text-orange-600 dark:text-orange-400': step.type === 'html',
+          'text-orange-600 dark:text-orange-400': step.type === 'html' || step.type === 'question',
           'text-indigo-600 dark:text-indigo-400': step.type === 'task' || step.type === 'skill',
           'text-gray-500': step.type === 'other',
         })}
@@ -646,7 +718,24 @@ const StepCard: React.FC<{
       </span>
       <div className='flex flex-col min-w-0 flex-1'>
         <span className='text-sm font-medium text-gray-800 dark:text-gray-200 truncate'>{step.title}</span>
-        {detailLine && <span className='text-[11px] text-gray-500 dark:text-gray-400 truncate'>{detailLine}</span>}
+        {thought &&
+          (() => {
+            const [intention, ...reasonLines] = (typeof thought === 'string' ? thought : '').split('\n');
+            const reason = reasonLines.join('\n').trim();
+            return (
+              <div className='mt-0.5'>
+                <span className='text-[12px] leading-4 text-slate-600 dark:text-slate-300'>
+                  {step.status === 'running' ? <StreamingText text={intention} /> : intention}
+                </span>
+                {reason && (
+                  <span className='block text-[11px] leading-4 text-slate-400 dark:text-slate-500'>{reason}</span>
+                )}
+              </div>
+            );
+          })()}
+        {!thought && step.subtitle && (
+          <span className='text-[11px] text-gray-500 dark:text-gray-400 truncate'>{step.subtitle}</span>
+        )}
       </div>
       <div className='flex-shrink-0'>
         {step.status === 'pending' && <ClockCircleOutlined className='text-xs text-gray-400' />}
@@ -659,6 +748,66 @@ const StepCard: React.FC<{
 });
 
 StepCard.displayName = 'StepCard';
+
+interface ParallelDispatchTask {
+  title: string;
+}
+
+const parseParallelDispatchTasks = (actionInput: unknown): ParallelDispatchTask[] => {
+  let parsed = actionInput;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return [];
+  const tasks = (parsed as { tasks?: unknown }).tasks;
+  if (!Array.isArray(tasks)) return [];
+  return tasks
+    .map(task => {
+      if (!task || typeof task !== 'object') return null;
+      const value = task as { title?: unknown; goal?: unknown };
+      const title = typeof value.title === 'string' ? value.title.trim() : '';
+      const goal = typeof value.goal === 'string' ? value.goal.trim() : '';
+      return title || goal ? { title: title || goal } : null;
+    })
+    .filter((task): task is ParallelDispatchTask => task !== null);
+};
+
+const ParallelDispatchSummary: React.FC<{ actionInput: unknown }> = memo(({ actionInput }) => {
+  const { t } = useTranslation();
+  const tasks = useMemo(() => parseParallelDispatchTasks(actionInput), [actionInput]);
+
+  return (
+    <div className='flex min-w-0 items-start gap-2 px-1 py-0.5'>
+      <span className='mt-[6px] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-300 dark:bg-slate-600' />
+      <div className='min-w-0 flex-1'>
+        <p className='m-0 text-[12px] leading-5 text-slate-500 dark:text-slate-400'>
+          {tasks.length > 0
+            ? t('parallel_tasks_dispatch_summary', { count: tasks.length })
+            : t('parallel_tasks_dispatch_summary_fallback')}
+        </p>
+        {tasks.length > 0 && (
+          <ul className='m-0 mt-0.5 list-none space-y-0.5 p-0'>
+            {tasks.map((task, index) => (
+              <li
+                key={`${index}-${task.title}`}
+                className='flex min-w-0 items-start gap-1.5 text-[11px] leading-5 text-slate-400 dark:text-slate-500'
+              >
+                <span className='mt-[8px] h-1 w-1 flex-shrink-0 rounded-full bg-slate-300 dark:bg-slate-600' />
+                <span className='line-clamp-2 min-w-0 break-words'>{task.title}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+});
+
+ParallelDispatchSummary.displayName = 'ParallelDispatchSummary';
 
 // Parse get_skill_resource step description to extract skill name, resource path, and content
 const parseSkillResourceDescription = (
@@ -780,14 +929,11 @@ const ThoughtBubble: React.FC<{ text: string | Record<string, unknown> }> = memo
   const reason = reasonLines.join('\n').trim();
 
   return (
-    <div className='flex min-w-0 items-start gap-2 px-1 py-1'>
-      <span className='mt-[5px] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-300 dark:bg-slate-600' />
-      <div className='min-w-0 text-[12px] leading-relaxed text-slate-500 dark:text-slate-400'>
-        <p className='m-0 break-words'>
-          <StreamingText text={intention} />
-        </p>
-        {reason && <p className='m-0 mt-0.5 break-words text-slate-400 dark:text-slate-500'>{reason}</p>}
-      </div>
+    <div className='min-w-0 px-1 py-1 text-[13px] leading-relaxed text-gray-900 dark:text-gray-100'>
+      <p className='m-0 break-words'>
+        <StreamingText text={intention} />
+      </p>
+      {reason && <p className='m-0 mt-1 break-words text-gray-600 dark:text-gray-300'>{reason}</p>}
     </div>
   );
 });
@@ -855,21 +1001,29 @@ const SectionBlock: React.FC<{
         <div className='ml-7 space-y-2 overflow-hidden'>
           {stepThoughts?.['initial'] && <ThoughtBubble text={stepThoughts['initial']} />}
 
-          {section.steps.map(step => (
-            <React.Fragment key={step.id}>
-              {stepThoughts?.[step.id] && <ThoughtBubble text={stepThoughts[step.id]} />}
-              {step.description?.includes('Action: get_skill_resource') ? (
-                <SkillResourceCard
-                  step={step}
-                  isActive={step.id === activeStepId}
-                  onClick={() => onStepClick(step.id)}
-                />
-              ) : (
-                <StepCard step={step} isActive={step.id === activeStepId} onClick={() => onStepClick(step.id)} />
-              )}
-              {step.description?.includes('Observation:') && <ObservationFormatter observation={step.description} />}
-            </React.Fragment>
-          ))}
+          {section.steps.map(step => {
+            const isParallelDispatch = step.action === 'dispatch_parallel_tasks';
+            return (
+              <React.Fragment key={step.id}>
+                {stepThoughts?.[step.id] && <ThoughtBubble text={stepThoughts[step.id]} />}
+                {isParallelDispatch ? (
+                  <div className='space-y-2'>
+                    <ParallelDispatchSummary actionInput={step.actionInput} />
+                    <StepCard step={step} isActive={step.id === activeStepId} onClick={() => onStepClick(step.id)} />
+                  </div>
+                ) : step.description?.includes('Action: get_skill_resource') ? (
+                  <SkillResourceCard
+                    step={step}
+                    isActive={step.id === activeStepId}
+                    onClick={() => onStepClick(step.id)}
+                  />
+                ) : (
+                  <StepCard step={step} isActive={step.id === activeStepId} onClick={() => onStepClick(step.id)} />
+                )}
+                {step.description?.includes('Observation:') && <ObservationFormatter observation={step.description} />}
+              </React.Fragment>
+            );
+          })}
         </div>
       )}
     </div>
@@ -886,8 +1040,10 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
   isWorking,
   userQuery,
   assistantText,
+  isAssistantStreaming = false,
   modelName,
   stepThoughts,
+  subAgentSlot,
   artifacts,
   onArtifactClick,
   onArtifactDownload,
@@ -895,7 +1051,7 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
   onShare: _onShare,
   isCollapsed,
   onExpand,
-  attachedFile,
+  attachedFiles,
   attachedKnowledge,
   attachedSkill,
   attachedDb,
@@ -904,6 +1060,8 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
   onSkillCardClick,
   onSkillDownload,
   taskPlan,
+  citationIndexes = [],
+  onReferencesClick,
 }) => {
   const { t } = useTranslation();
   const handleStepClick = useCallback(
@@ -954,21 +1112,6 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
         {userQuery && (
           <div className='flex justify-end'>
             <div className='max-w-[85%] space-y-2'>
-              {attachedFile && (
-                <div className='flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl border border-gray-200 dark:border-gray-700/60 bg-white dark:bg-[#1a1b1e] shadow-sm'>
-                  <div className='w-8 h-8 rounded-lg bg-green-50 dark:bg-green-900/30 flex items-center justify-center flex-shrink-0'>
-                    {getFileIconElement(attachedFile.name, attachedFile.type)}
-                  </div>
-                  <div className='min-w-0 flex-1'>
-                    <div className='text-sm font-medium text-gray-800 dark:text-gray-200 truncate'>
-                      {attachedFile.name}
-                    </div>
-                    <div className='text-[11px] text-gray-400 dark:text-gray-500'>
-                      {getFileTypeLabel(attachedFile.name, t, attachedFile.type)} · {formatFileSize(attachedFile.size)}
-                    </div>
-                  </div>
-                </div>
-              )}
               {attachedKnowledge && (
                 <div className='flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl border border-gray-200 dark:border-gray-700/60 bg-white dark:bg-[#1a1b1e] shadow-sm'>
                   <div className='w-8 h-8 rounded-lg bg-orange-50 dark:bg-orange-900/30 flex items-center justify-center flex-shrink-0'>
@@ -1028,7 +1171,8 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
                   </div>
                 </div>
               ))}
-              <div className='rounded-2xl bg-gray-100 dark:bg-[#2a2b2f] px-4 py-3 text-sm text-gray-800 dark:text-gray-200 leading-relaxed'>
+              <AttachmentMessageCards files={attachedFiles} />
+              <div className='rounded-2xl bg-gray-100 dark:bg-[#2a2b2f] px-4 py-3 text-sm text-gray-800 dark:text-gray-200 leading-relaxed shadow-sm'>
                 {userQuery}
               </div>
             </div>
@@ -1076,6 +1220,11 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
           </div>
         )}
 
+        {/* Parallel sub-agent activity — rendered after the thinking timeline,
+            but ABOVE the task-plan list so the plan card stays at the bottom
+            (its original position). */}
+        {subAgentSlot}
+
         {taskPlan && taskPlan.length > 0 && (
           <div className='mt-3 px-1'>
             <TaskPlanCard tasks={taskPlan} defaultCollapsed={false} />
@@ -1085,8 +1234,22 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
         {assistantText && (
           <div className='mt-4 px-1'>
             <div className='prose prose-sm dark:prose-invert max-w-none text-gray-800 dark:text-gray-200 leading-relaxed'>
-              <MarkdownContext>{assistantText}</MarkdownContext>
+              {isAssistantStreaming ? (
+                <span className='whitespace-pre-wrap break-words'>{assistantText}</span>
+              ) : (
+                <MarkdownContext>{assistantText}</MarkdownContext>
+              )}
             </div>
+            {citationIndexes.length > 0 && onReferencesClick && (
+              <button
+                type='button'
+                onClick={onReferencesClick}
+                className='mt-3 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 hover:text-blue-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 dark:text-blue-400 dark:hover:bg-blue-500/10 dark:hover:text-blue-300'
+              >
+                <BookOutlined aria-hidden />
+                查看 {citationIndexes.length} 条参考来源
+              </button>
+            )}
           </div>
         )}
 

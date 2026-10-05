@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -11,8 +12,18 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, Depends, File, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from dbgpt._private.config import Config
 from dbgpt._private.pydantic import BaseModel as _BaseModel
@@ -30,6 +41,7 @@ from dbgpt_app.openapi.api_v1.react_agent_sse import (
     emit_react_agent_event,
     terminal_error_events,
 )
+from dbgpt.util.json_utils import parse_or_raise_error
 from dbgpt_app.openapi.api_view_model import (
     ConversationVo,
     Result,
@@ -40,6 +52,24 @@ from dbgpt_app.scene.chat_db.manufacturing_mongo_stream import (
 )
 from dbgpt_serve.datasource.manages import ConnectorManager
 from dbgpt_serve.utils.auth import UserRequest, get_user_from_headers
+
+from .attachment_react_adapter import (
+    AttachmentInputError,
+    SessionAttachmentContext,
+    build_file_context,
+    build_input_files_v2,
+    prepare_react_attachments,
+    react_state_patch,
+    resolve_legacy_chat_file_path,
+    scrub_react_history_for_share,
+)
+from .react_final import AgentFinalAnswer, FinalAnswerAssembler
+from .subagent.dispatcher import DISPATCH_PROMPT_SECTION, make_dispatch_tool
+from .subagent.history import (
+    build_subagent_history_snapshot,
+    fail_running_subagent_history,
+    update_subagent_history,
+)
 
 router = APIRouter()
 CFG = Config()
@@ -866,7 +896,8 @@ def _extract_skill_from_zip(
         the top-level archive directory name.
 
     Raises:
-        ValueError: If the archive contains path-traversal sequences.
+        ValueError: If the archive contains path-traversal or absolute
+            entries.
         ValueError: If no ``SKILL.md`` is found after extraction (only when
             ``strict=True``).
         ValueError: If the archive root contains multiple sub-directories with
@@ -876,10 +907,23 @@ def _extract_skill_from_zip(
     with zipfile.ZipFile(zip_path, "r") as zf:
         all_names = zf.namelist()
 
-        # Security: reject any path-traversal entries
+        # Security: reject any path-traversal or absolute entries
         for name in all_names:
             normalized = os.path.normpath(name)
-            if normalized.startswith("..") or ".." in normalized.split(os.sep):
+            if (
+                normalized.startswith("..")
+                or ".." in normalized.split(os.sep)
+                # Absolute entry names ("/tmp/x", "C:\x"): "dest_dir / rel"
+                # discards the base entirely for absolute paths (pathlib
+                # semantics), giving an arbitrary file write.
+                or PurePosixPath(name).is_absolute()
+                or PureWindowsPath(name).is_absolute()
+                # "top//tmp/x" collapses under normpath, but the raw member is
+                # sliced on skill_prefix below, leaving a leading "/" in rel.
+                or "//" in name
+                # Windows separators must not leak into host path joins.
+                or "\\" in name
+            ):
                 raise ValueError(f"Unsafe path in archive: {name!r}")
 
         # Filter out macOS metadata artifacts before analysing structure
@@ -949,6 +993,13 @@ def _extract_skill_from_zip(
             if not rel:
                 continue
             target = dest_dir / rel
+            try:
+                # Containment guard: even if a member name slipped past the
+                # scan above, an entry whose join escapes dest_dir must be
+                # rejected before anything is written.
+                target.relative_to(dest_dir)
+            except ValueError:
+                raise ValueError(f"Unsafe path in archive: {member!r}") from None
             if member.endswith("/"):
                 target.mkdir(parents=True, exist_ok=True)
             else:
@@ -1252,8 +1303,236 @@ def _declares_governed_query_contract(dialogue: ConversationVo) -> bool:
     )
 
 
+def _build_react_history_payload(
+    *,
+    final_content: str,
+    steps: List[Dict[str, Any]],
+    task_plan: List[Dict[str, Any]],
+    generated_images: List[Any],
+    sub_agents: Any,
+    input_files: List[Dict[str, Any]],
+    citations: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Serialize the persisted react-agent history payload (version 2).
+
+    The success and error paths share this builder so both persist the same
+    shape. ``input_files`` is the current turn's public snapshot produced by
+    :func:`build_input_files_v2` — safe metadata only, never server paths,
+    storage URIs, owner ids, hashes or inspection bodies. ``citations`` comes
+    from the final-answer assembler and remains display-safe metadata.
+    """
+    return json.dumps(
+        {
+            "version": 2,
+            "protocol_version": 2,
+            "type": "react-agent",
+            "final_content": final_content,
+            "citations": citations or [],
+            "steps": steps,
+            "task_plan": task_plan,
+            "generated_images": generated_images,
+            "sub_agents": sub_agents,
+            "input_files": input_files,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _sse_event_type(event: Any) -> Optional[str]:
+    """Read an SSE event type without trusting arbitrary streamed text."""
+    if not isinstance(event, str):
+        return None
+    first_line = event.splitlines()[0] if event else ""
+    if not first_line.startswith("data:"):
+        return None
+    try:
+        payload = json.loads(first_line.removeprefix("data:").strip())
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    event_type = payload.get("type") if isinstance(payload, dict) else None
+    return event_type if isinstance(event_type, str) else None
+
+
+def _react_terminal_events(
+    storage_conv: Any,
+    history_payload: str,
+    final_answer: AgentFinalAnswer,
+) -> Tuple[str, str]:
+    """Persist one ReAct round without risking its terminal SSE events."""
+    try:
+        storage_conv.add_view_message(history_payload)
+        storage_conv.end_current_round()
+        storage_conv.save_to_storage()
+    except Exception:
+        logger.exception("Failed to persist ReAct agent history")
+
+    return (
+        _sse_event(final_answer.to_sse_payload()),
+        _sse_event({"type": "done"}),
+    )
+
+
+async def _cancel_and_await_agent_task(task: "asyncio.Task[Any]") -> None:
+    """Cancel a running agent task and always consume its terminal result."""
+    was_done = task.done()
+    if not was_done:
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        if not was_done:
+            logger.exception("ReAct agent task failed during stream cleanup")
+
+
 async def _react_agent_stream(
     dialogue: ConversationVo,
+    tool_mode: str = "full",
+    attachment_ctx: Optional[SessionAttachmentContext] = None,
+) -> AsyncGenerator[str, None]:
+    """Stream the ReAct agent turn, owning the attachment lifecycle.
+
+    The resolved session-file attachment context (when ``file_ids`` were
+    supplied) stays open for the whole turn and is closed exactly once when
+    the stream completes, fails, or is closed early by the client.
+
+    Args:
+        dialogue: Conversation parameters (user input, model, ext_info, etc.).
+        tool_mode: "full" (default) — all tools; "knowledge" — kb tools only.
+        attachment_ctx: Pre-resolved attachment context for this turn (or
+            ``None`` for pure-text / legacy ``file_path`` requests).
+    """
+    try:
+        async for event in _react_agent_stream_inner(
+            dialogue, tool_mode, attachment_ctx
+        ):
+            yield event
+    finally:
+        if attachment_ctx is not None:
+            try:
+                attachment_ctx.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close session attachment context", exc_info=True
+                )
+
+
+def _legacy_upload_base_dir() -> str:
+    """Return the base dir of the legacy ``python_uploads`` tree."""
+    app = CFG.SYSTEM_APP
+    work_dir = getattr(app, "work_dir", None) if app else None
+    return work_dir or os.getcwd()
+
+
+async def _open_turn_attachments(
+    dialogue: ConversationVo, user_token: Optional[UserRequest]
+) -> Optional[SessionAttachmentContext]:
+    """Validate file input and resolve session attachments before streaming.
+
+    Conflicting/malformed/too-many inputs raise 400; any unresolvable
+    ``file_id`` raises one indistinguishable, non-enumerating 404. Errors
+    always surface before the SSE stream (and the agent) is constructed.
+    """
+    owner_id = (user_token.user_id if user_token else None) or dialogue.user_name
+    try:
+        attachment_ctx = await prepare_react_attachments(dialogue, owner_id=owner_id)
+        if attachment_ctx is None:
+            # Legacy ``ext_info.file_path`` requests are confined to the
+            # authenticated owner's ``python_uploads/<owner>`` root; invalid
+            # input raises the same 400 and ownership failures the same
+            # non-enumerating 404 as the file_ids flow.
+            try:
+                spec = dialogue.file_input_spec()
+            except Exception:
+                spec = None
+            legacy_path = spec.file_path if spec is not None else None
+            if legacy_path:
+                resolved = await run_in_threadpool(
+                    lambda: resolve_legacy_chat_file_path(
+                        file_path=legacy_path,
+                        owner_id=owner_id,
+                        base_dir=_legacy_upload_base_dir(),
+                    )
+                )
+                dialogue.ext_info = dict(dialogue.ext_info or {})
+                dialogue.ext_info["file_path"] = resolved
+        return attachment_ctx
+    except AttachmentInputError as error:
+        raise HTTPException(
+            status_code=error.status_code, detail=error.message
+        ) from error
+
+
+def _close_turn_attachments_quietly(
+    attachment_ctx: Optional[SessionAttachmentContext],
+) -> None:
+    """Close the turn attachment context, logging instead of raising."""
+    if attachment_ctx is None:
+        return
+    try:
+        attachment_ctx.close()
+    except Exception:
+        logger.warning("Failed to close session attachment context", exc_info=True)
+
+
+async def _react_agent_stream_inner(
+    dialogue: ConversationVo,
+    tool_mode: str = "full",
+    attachment_ctx: Optional[SessionAttachmentContext] = None,
+) -> AsyncGenerator[str, None]:
+    """Stream ReAct events while owning the lifetime of its background task."""
+    agent_task_holder: List["asyncio.Task[Any]"] = []
+    final_emitted = False
+    done_emitted = False
+    try:
+        async for event in _react_agent_stream_impl(
+            dialogue,
+            tool_mode=tool_mode,
+            attachment_ctx=attachment_ctx,
+            agent_task_holder=agent_task_holder,
+        ):
+            event_type = _sse_event_type(event)
+            final_emitted = final_emitted or event_type == "final"
+            done_emitted = done_emitted or event_type == "done"
+            yield event
+    except Exception:
+        logger.exception("ReAct agent stream failed before normal completion")
+        if not final_emitted and not done_emitted:
+            yield _sse_event(
+                AgentFinalAnswer(
+                    content="抱歉，回答生成过程中发生错误，请重试。"
+                ).to_sse_payload()
+            )
+        if not done_emitted:
+            yield _sse_event({"type": "done"})
+    finally:
+        if agent_task_holder:
+            await _cancel_and_await_agent_task(agent_task_holder[0])
+
+
+class _AgentStreamingResponse(StreamingResponse):
+    """Streaming response that explicitly closes its owned body iterator."""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self.body_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to close ReAct agent stream iterator")
+
+
+async def _react_agent_stream_impl(
+    dialogue: ConversationVo,
+    tool_mode: str = "full",
+    attachment_ctx: Optional[SessionAttachmentContext] = None,
+    agent_task_holder: Optional[List["asyncio.Task[Any]"]] = None,
 ) -> AsyncGenerator[str, None]:
     """Route declared typed contracts away from the probabilistic ReAct loop."""
 
@@ -1281,7 +1560,15 @@ async def _general_react_agent_stream(
     dialogue: ConversationVo,
 ) -> AsyncGenerator[str, None]:
     import asyncio
+    """Core ReAct agent streaming logic.
 
+    Args:
+        dialogue: Conversation parameters (user input, model, ext_info, etc.).
+        tool_mode: "full" (default) — all tools (skills, shell, sql, html, code, kb...).
+                   "knowledge" — only knowledge base tools + todowrite + terminate,
+                   optimized for pure knowledge-chat scenarios.
+        attachment_ctx: Pre-resolved session attachment context for this turn.
+    """
     from dbgpt.agent import AgentContext, AgentMemory, AgentMessage
     from dbgpt.agent.claude_skill import get_registry, load_skills_from_dir
     from dbgpt.agent.core.memory.gpts import (
@@ -1289,15 +1576,13 @@ async def _general_react_agent_stream(
         GptsMemory,
     )
     from dbgpt.agent.expand.actions.react_action import Terminate
-    from dbgpt.agent.expand.react_agent import ReActAgent
-    from dbgpt.agent.resource import ToolPack, tool
-    from dbgpt.agent.resource.base import AgentResource, ResourceType
+    from dbgpt.agent.expand.tool_calling_agent import ToolCallingReActAgent
+    from dbgpt.agent.resource import ToolPack
     from dbgpt.agent.resource.manage import get_resource_manager
     from dbgpt.agent.util.llm.llm import LLMConfig, LLMStrategyType
     from dbgpt.agent.util.react_parser import ReActOutputParser
     from dbgpt.core import StorageConversation
     from dbgpt.model.cluster.client import DefaultLLMClient
-    from dbgpt.util.code.server import get_code_server
     from dbgpt_serve.agent.agents.db_gpts_memory import MetaDbGptsMessageMemory
     from dbgpt_serve.conversation.serve import Serve as ConversationServe
 
@@ -1378,6 +1663,32 @@ async def _general_react_agent_stream(
 
     # Connector selection (Task C): only inject user-selected connectors.
     connector_ids: List[str] = _parse_connector_ids(dialogue.ext_info)
+
+    def _has_code_graph(knowledge_space_id: str) -> bool:
+        """Check if the knowledge space has a built code graph index.
+
+        Used to conditionally expose codegraph tools (kb_codegraph_*) to the
+        agent. Returns True only when the graph meta record exists and has a
+        non-zero vertex count.
+        """
+        if not knowledge_space_id:
+            return False
+        try:
+            from dbgpt_serve.rag.models.code_graph_db import CodeGraphMetaDao
+            from dbgpt_serve.rag.tools.kb_file_tools import _resolve_space_name
+
+            space_name = _resolve_space_name(knowledge_space_id)
+            meta = CodeGraphMetaDao().get_by_knowledge_id(space_name)
+            return bool(meta and (meta.vertex_count or 0) > 0)
+        except Exception as e:
+            logger.warning(
+                f"Failed to check code graph status for {knowledge_space_id}: {e}"
+            )
+            return False
+
+    code_graph_available = (
+        _has_code_graph(knowledge_space) if knowledge_space else False
+    )
 
     def build_step(title: str, detail: str, phase: str = None):
         nonlocal step
@@ -1636,11 +1947,38 @@ async def _general_react_agent_stream(
                 system_app=CFG.SYSTEM_APP,
             )
             knowledge_resources.append(knowledge_resource)
+            # resolve wiki visibility here (this block runs before the
+            # tool-assembly block where kb_tool_list is built)
+            from .tools.kb_tools import _wiki_enabled
+
+            wiki_available = _wiki_enabled(knowledge_space)
+            codegraph_tools_desc = (
+                """
+  - kb_codegraph_explore: Query code structure (classes, call chains, inheritance)
+  - kb_codegraph_call_chain: Trace who calls / is called by a function
+  - kb_codegraph_class_hierarchy: Trace class inheritance and implementations
+"""
+                if code_graph_available
+                else ""
+            )
+            wiki_tools_desc = (
+                """
+  - kb_wiki_search: Search this space's auto-generated LLM-Wiki pages (curated, synthesized knowledge)
+  - kb_wiki_read_page: Read one wiki page by slug (e.g. kb_wiki_read_page('index') for the catalog)
+  - kb_wiki_index: List the wiki catalog: folders and pages with one-line summaries"""
+                if wiki_available
+                else ""
+            )
             knowledge_context = f"""
 ## Knowledge Base
 - Knowledge space: {knowledge_resource.retriever_name or knowledge_space}
 - Description: {knowledge_resource.retriever_desc or "Knowledge retrieval available"}
-- You can use the 'knowledge_retrieve' tool to search this knowledge base.
+- Available tools:
+  - kb_ls: List files and directories in the knowledge base
+  - kb_glob: Search files by name or glob pattern
+  - kb_grep: Search file contents by keyword (prefer for exact matches)
+  - kb_cat: Read the content of a specific file
+  - semantic_search: Semantic search (use when kb_grep returns insufficient results){codegraph_tools_desc}{wiki_tools_desc}
 """
             logger.info(
                 f"Loaded knowledge space resource: {knowledge_space} "
@@ -1907,6 +2245,8 @@ async def _general_react_agent_stream(
 
     @tool(description="Execute quick analysis on uploaded Excel/CSV file.")
     async def execute_analysis() -> str:
+        from dbgpt.util.code.server import get_code_server
+
         matched = react_state.get("matched")
         if not react_state.get("file_path"):
             return json.dumps(
@@ -1998,6 +2338,8 @@ print(json.dumps(summary, ensure_ascii=False))
 
     @tool(description="Resolve required tools for the selected skill.")
     def load_tools() -> str:
+        from dbgpt.agent.resource.base import AgentResource, ResourceType
+
         matched = react_state.get("matched")
         rm = get_resource_manager(CFG.SYSTEM_APP)
         required_tools = matched.metadata.required_tools if matched else []
@@ -2037,6 +2379,8 @@ print(json.dumps(summary, ensure_ascii=False))
 
     @tool(description="Execute a tool by name with JSON args.")
     async def execute_tool(tool_name: str, args: dict) -> str:
+        from dbgpt.agent.resource.base import AgentResource, ResourceType
+
         try:
             from dbgpt.agent.resource.connector.confirmation import (
                 _PENDING_CONFIRMATIONS,
@@ -2375,7 +2719,80 @@ print(json.dumps(summary, ensure_ascii=False))
                         ]
                     },
                     ensure_ascii=False,
+    # ── Import built-in tools from tools/ directory ──
+    from dbgpt_app.openapi.api_v1.tools import (
+        make_code_interpreter,
+        make_execute_analysis,
+        make_execute_skill_script_file,
+        make_execute_tool,
+        make_html_interpreter,
+        make_kb_tools,
+        make_knowledge_retrieve,
+        make_load_file,
+        make_load_skill,
+        make_load_tools,
+        make_question,
+        make_read_file,
+        make_shell_interpreter,
+        make_sql_query,
+        make_todowrite,
+    )
+    # ── Build tool instances via factory functions ──────────────────────────
+    # (Inline @tool definitions have been moved to tools/ directory.)
+    # Local helper aliases used by the SSE loop are defined below.
+
+    # ── Stream queue (created early so question tool can use it) ────────
+    stream_queue: asyncio.Queue = asyncio.Queue()
+
+    async def stream_callback(event_type: str, payload: Dict[str, Any]) -> None:
+        await stream_queue.put({"type": event_type, **payload})
+
+    # ── Build tool instances from tools/ directory ───────────────────────
+    _todo_list: List[Dict[str, str]] = []
+    # Reuse one visible plan card across all todowrite updates in this round.
+    # The mutable single-item list acts as a closure cell.
+    _todo_step_holder: List[str] = []
+    load_skill_tool = make_load_skill(react_state)
+    load_file_tool = make_load_file(react_state)
+    execute_analysis_tool = make_execute_analysis(react_state)
+    load_tools_tool = make_load_tools(react_state)
+    execute_tool_tool = make_execute_tool(react_state)
+    # Knowledge tools: use kb_tools (kb_ls, kb_glob, kb_grep, kb_cat, semantic_search)
+    # when a knowledge space is connected, otherwise fall back to knowledge_retrieve
+    if knowledge_space:
+        kb_tool_list = make_kb_tools(knowledge_space)
+        # Filter out codegraph tools when the space has no built code graph,
+        # so the agent never sees tools it cannot use successfully.
+        # @tool decorator wraps the function; the tool name lives on `._tool.name`
+        # (and `.__name__` via functools.wraps).
+        if not code_graph_available:
+            kb_tool_list = [
+                t
+                for t in kb_tool_list
+                if not getattr(getattr(t, "_tool", t), "name", "").startswith(
+                    "kb_codegraph"
                 )
+            ]
+        # wiki visibility for prompt sections (tools are mounted inside
+        # make_kb_tools via _make_kb_wiki_tools, gated on index_methods)
+        wiki_available = any(
+            getattr(getattr(t, "_tool", t), "name", "").startswith("kb_wiki_")
+            for t in kb_tool_list
+        )
+    else:
+        # No knowledge space connected — use legacy knowledge_retrieve (no-op without resources)
+        kb_tool_list = [make_knowledge_retrieve(react_state, knowledge_resources)]
+    sql_query_tool = make_sql_query(react_state, database_connector)
+    code_interpreter_tool = make_code_interpreter(react_state)
+    shell_interpreter_tool = make_shell_interpreter(react_state)
+    html_interpreter_tool = make_html_interpreter(react_state, DEFAULT_SKILLS_DIR)
+    todowrite_tool = make_todowrite(_todo_list, stream_callback)
+    question_tool = make_question(react_state, stream_callback)
+    # read_file lets the agent read back persisted tool results / snapshots
+    # from disk when a <persisted-output> block references a file path.
+    read_file_tool = make_read_file(react_state)
+    # Keep local aliases for backward compatibility (SSE loop references these names)
+    execute_skill_script_file_tool = make_execute_skill_script_file(react_state)
 
             # result[0] = column names, result[1:] = data rows. A header-only
             # result is valid execution evidence for a no-traffic window.
@@ -2511,1116 +2928,6 @@ print(json.dumps(summary, ensure_ascii=False))
                 },
                 ensure_ascii=False,
             )
-
-    def _try_repair_truncated_code(raw_code: str) -> Optional[str]:
-        """Attempt to fix code that was truncated by the LLM's token limit.
-
-        Common symptoms: unterminated string literals, unclosed brackets/parens.
-        Strategy:
-          1. Remove the last (likely incomplete) logical line.
-          2. Close any remaining open brackets / parentheses.
-          3. Re-compile. If it passes, return the repaired code.
-        Returns None if repair is not possible.
-        """
-
-        lines = raw_code.split("\n")
-        # Try progressively removing trailing lines (up to 10) to find a
-        # clean cut-off point.
-        for trim in range(1, min(11, len(lines))):
-            candidate_lines = lines[: len(lines) - trim]
-            if not candidate_lines:
-                continue
-            candidate = "\n".join(candidate_lines)
-
-            # Strip any trailing incomplete string by trying to tokenize
-            # and removing broken tail tokens.
-            # Close unmatched brackets/parens/braces
-            open_chars = {"(": ")", "[": "]", "{": "}"}
-            close_chars = set(open_chars.values())
-            stack: list = []
-            for ch in candidate:
-                if ch in open_chars:
-                    stack.append(open_chars[ch])
-                elif ch in close_chars:
-                    if stack and stack[-1] == ch:
-                        stack.pop()
-
-            # Append closing chars in reverse order
-            if stack:
-                candidate += "\n" + "".join(reversed(stack))
-
-            try:
-                compile(candidate, "<repair>", "exec")
-                return candidate
-            except SyntaxError:
-                continue
-        return None
-
-    @tool(
-        description="Execute Python code for data analysis and computation. "
-        "Supports pandas, numpy, matplotlib, json, os, etc. "
-        "Use this tool when you need to run Python code to process data, "
-        "generate charts, or perform calculations. "
-        'Parameters: {{"code": "python code string"}}'
-    )
-    async def code_interpreter(code: str) -> str:
-        """Execute arbitrary Python code and return stdout/stderr.
-
-        Runs in a subprocess using the project's Python interpreter,
-        so all installed packages (pandas, numpy, etc.) are available.
-        CRITICAL: Each call is completely independent — variables do NOT
-        persist between calls. Every code snippet MUST include all necessary
-        data loading (e.g. df = pd.read_csv(FILE_PATH)) and processing.
-        Never assume df or any other variable already exists.
-        Always print() results you want to see in the output.
-        """
-        import asyncio
-        import shutil
-        import sys
-        import uuid
-
-        from dbgpt.configs.model_config import PILOT_PATH, STATIC_MESSAGE_IMG_PATH
-
-        if not code or not code.strip():
-            return json.dumps(
-                {
-                    "chunks": [
-                        {
-                            "output_type": "text",
-                            "content": "No code provided",
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-        # Use persistent work dir under pilot/tmp/{conv_id} so files
-        # survive across calls and can be referenced later (e.g. in HTML).
-        cid = react_state.get("conv_id") or "default"
-        work_dir = os.path.join(PILOT_PATH, "tmp", cid)
-        os.makedirs(work_dir, exist_ok=True)
-
-        # Collect image files that existed BEFORE this run
-        IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
-        pre_existing_images: set = set()
-        for root, _dirs, files in os.walk(work_dir):
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext in IMAGE_EXTS:
-                    pre_existing_images.add(os.path.join(root, f))
-
-        preamble_lines = [
-            "import json",
-            "import os",
-            "import pandas as pd",
-            "import numpy as np",
-            f'PLOT_DIR = r"{work_dir}"',
-            "os.makedirs(PLOT_DIR, exist_ok=True)",
-        ]
-        fp = react_state.get("file_path")
-        if fp:
-            preamble_lines.append(f'FILE_PATH = r"{fp}"')
-        preamble = "\n".join(preamble_lines) + "\n"
-        full_code = preamble + code
-
-        try:
-            compile(full_code, "<code_interpreter>", "exec")
-        except SyntaxError as se:
-            # Attempt auto-repair for truncated code (common with long LLM
-            # outputs that hit the token limit).
-            repaired = _try_repair_truncated_code(full_code)
-            if repaired is not None:
-                logger.warning(
-                    "code_interpreter: auto-repaired truncated code "
-                    f"(original SyntaxError: {se.msg} line {se.lineno})"
-                )
-                full_code = repaired
-                # Strip the preamble back out for the "code" display chunk
-                code = full_code[len(preamble) :]
-            else:
-                error_msg = (
-                    f"SyntaxError before execution: {se.msg} "
-                    f"(line {se.lineno})\n"
-                    "Please regenerate complete, syntactically valid Python "
-                    "code. Keep code under 80 lines and split long tasks "
-                    "into multiple code_interpreter calls."
-                )
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {"output_type": "code", "content": code.strip()},
-                            {"output_type": "text", "content": error_msg},
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-
-        try:
-            tmp_path = os.path.join(work_dir, "_run.py")
-            with open(tmp_path, "w", encoding="utf-8") as tmp:
-                tmp.write(full_code)
-
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                tmp_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=work_dir,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            output_text = stdout.decode("utf-8", errors="replace")
-            error_text = stderr.decode("utf-8", errors="replace")
-
-            if proc.returncode != 0 and error_text:
-                output_text = (
-                    output_text + "\n[ERROR]\n" + error_text
-                    if output_text
-                    else error_text
-                )
-        except asyncio.TimeoutError:
-            output_text = "Execution timed out (60s limit)"
-        except Exception as e:
-            output_text = f"Execution error: {e}"
-
-        chunks: List[Dict[str, Any]] = [
-            {"output_type": "code", "content": code.strip()},
-        ]
-        if output_text.strip():
-            clean_output = output_text.strip()
-            max_out_len = 2000
-            if len(clean_output) > max_out_len:
-                truncation_notice = (
-                    f"\n\n... [Output truncated, length: {len(clean_output)} chars."
-                    f" Only showing first {max_out_len} chars."
-                    f" If you generated HTML, the file is saved.]"
-                )
-                clean_output = clean_output[:max_out_len] + truncation_notice
-            chunks.append({"output_type": "text", "content": clean_output})
-        else:
-            chunks.append(
-                {
-                    "output_type": "text",
-                    "content": "(no output — add print() to see results)",
-                }
-            )
-
-        # Scan work_dir recursively for NEW image files generated by this run
-        try:
-            os.makedirs(STATIC_MESSAGE_IMG_PATH, exist_ok=True)
-            for root, _dirs, files in os.walk(work_dir):
-                for fname in files:
-                    ext = os.path.splitext(fname)[1].lower()
-                    full_path = os.path.join(root, fname)
-                    if ext in IMAGE_EXTS and full_path not in pre_existing_images:
-                        unique_name = f"{uuid.uuid4().hex[:8]}_{fname}"
-                        dest = os.path.join(STATIC_MESSAGE_IMG_PATH, unique_name)
-                        shutil.copy2(full_path, dest)
-                        img_url = f"/images/{unique_name}"
-                        chunks.append(
-                            {
-                                "output_type": "image",
-                                "content": img_url,
-                            }
-                        )
-                        # Track generated images in react_state for
-                        # html_interpreter to reference later
-                        react_state.setdefault("generated_images", []).append(img_url)
-        except Exception:
-            pass
-
-        # Clean up the temp script file but keep work_dir for persistence
-        try:
-            script_path = os.path.join(work_dir, "_run.py")
-            if os.path.exists(script_path):
-                os.remove(script_path)
-        except Exception:
-            pass
-
-        # Append a summary of ALL generated images so far, so the LLM
-        # has a clear reference when generating HTML later.
-        all_images = react_state.get("generated_images", [])
-        if all_images:
-            img_summary = "已生成的图片URL（在生成HTML时请使用这些URL）:\n" + "\n".join(
-                f"  - {url}" for url in all_images
-            )
-            chunks.append({"output_type": "text", "content": img_summary})
-
-        return json.dumps({"chunks": chunks}, ensure_ascii=False)
-
-    @tool(
-        description="Execute shell/bash commands in a sandboxed environment. "
-        "Use this tool when you need to run shell commands such as ls, cat, "
-        "grep, curl, apt, pip, git, or any other CLI tool. "
-        "The sandbox provides resource limits (256MB memory, 30s timeout) "
-        "and process isolation. "
-        'Parameters: {"code": "shell command(s) to execute"}'
-    )
-    async def shell_interpreter(code: str) -> str:
-        """Execute shell/bash commands in a sandboxed environment.
-
-        Uses dbgpt-sandbox LocalRuntime to run bash scripts with:
-        - Memory limit: 256MB
-        - Timeout: 30 seconds
-        - Process tree management (cleanup on timeout/error)
-        - Security validation (blocks dangerous patterns like rm -rf /)
-        Each call is independent — no state persists between calls.
-        """
-        import uuid
-
-        if not code or not code.strip():
-            return json.dumps(
-                {
-                    "chunks": [
-                        {
-                            "output_type": "text",
-                            "content": "No command provided",
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-        try:
-            from dbgpt_sandbox.sandbox.execution_layer.base import (
-                ExecutionStatus,
-                SessionConfig,
-            )
-            from dbgpt_sandbox.sandbox.execution_layer.local_runtime import (
-                LocalRuntime,
-            )
-        except ImportError:
-            return json.dumps(
-                {
-                    "chunks": [
-                        {"output_type": "code", "content": code.strip()},
-                        {
-                            "output_type": "text",
-                            "content": (
-                                "Error: dbgpt-sandbox package is not installed. "
-                                "Please install it with: pip install dbgpt-sandbox"
-                            ),
-                        },
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-        session_id = f"bash_{uuid.uuid4().hex[:12]}"
-        runtime = LocalRuntime()
-
-        from dbgpt.configs.model_config import ROOT_PATH
-
-        sandbox_work_dir = ROOT_PATH
-        os.makedirs(sandbox_work_dir, exist_ok=True)
-
-        config = SessionConfig(
-            language="bash",
-            working_dir=sandbox_work_dir,
-            max_memory=256 * 1024 * 1024,  # 256MB
-            timeout=30,
-        )
-
-        output_text = ""
-        try:
-            session = await runtime.create_session(session_id, config)
-            result = await session.execute(code)
-
-            if result.status == ExecutionStatus.SUCCESS:
-                output_text = result.output or ""
-            elif result.status == ExecutionStatus.TIMEOUT:
-                output_text = f"Execution timed out ({config.timeout}s limit)"
-            else:
-                output_text = result.error or "Unknown execution error"
-                if result.output:
-                    output_text = result.output + "\n[ERROR]\n" + output_text
-        except Exception as e:
-            output_text = f"Sandbox execution error: {e}"
-        finally:
-            try:
-                await runtime.destroy_session(session_id)
-            except Exception:
-                pass
-
-        chunks: List[Dict[str, Any]] = [
-            {"output_type": "code", "content": code.strip()},
-        ]
-        if output_text.strip():
-            chunks.append({"output_type": "text", "content": output_text.strip()})
-        else:
-            chunks.append(
-                {
-                    "output_type": "text",
-                    "content": "(no output)",
-                }
-            )
-
-        # ── Safety-net post-processing for skill script execution ──
-        # If the LLM used shell_interpreter to run a skill script despite
-        # the prompt requesting execute_skill_script_file, we still capture
-        # critical side-effects (ratio_data, images) into react_state.
-        _code_lower = code.strip().lower()
-        _is_skill_script = "skills/" in _code_lower and ".py" in _code_lower
-        if _is_skill_script and output_text.strip():
-            import shutil
-
-            from dbgpt.configs.model_config import STATIC_MESSAGE_IMG_PATH
-
-            # 1) Capture calculate_ratios.py output as ratio_data
-            if "calculate_ratios" in _code_lower:
-                try:
-                    ratio_data = json.loads(output_text.strip())
-                    if isinstance(ratio_data, dict):
-                        react_state["ratio_data"] = ratio_data
-                        logger.info(
-                            "shell_interpreter: captured %d ratio_data keys",
-                            len(ratio_data),
-                        )
-                except Exception:
-                    pass
-
-            # 2) Capture generate_charts.py output — look for image paths
-            #    and copy them to static dir, same as execute_skill_script_file
-            if "generate_charts" in _code_lower:
-                try:
-                    os.makedirs(STATIC_MESSAGE_IMG_PATH, exist_ok=True)
-                    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
-                    # Try to parse JSON output for image paths
-                    try:
-                        chart_output = json.loads(output_text.strip())
-                        if isinstance(chart_output, dict):
-                            # Might be {"charts": {...}} or flat dict
-                            chart_map = chart_output.get("charts", chart_output)
-                            for name, abs_path in chart_map.items():
-                                if isinstance(abs_path, str) and os.path.isfile(
-                                    abs_path
-                                ):
-                                    ext = os.path.splitext(abs_path)[1].lower()
-                                    if ext in IMAGE_EXTS:
-                                        unique_name = (
-                                            f"{uuid.uuid4().hex[:8]}_"
-                                            f"{os.path.basename(abs_path)}"
-                                        )
-                                        dest = os.path.join(
-                                            STATIC_MESSAGE_IMG_PATH, unique_name
-                                        )
-                                        shutil.copy2(abs_path, dest)
-                                        img_url = f"/images/{unique_name}"
-                                        react_state.setdefault(
-                                            "generated_images", []
-                                        ).append(img_url)
-                                        orig_stem = os.path.splitext(
-                                            os.path.basename(abs_path)
-                                        )[0].lower()
-                                        react_state.setdefault("image_url_map", {})[
-                                            orig_stem
-                                        ] = img_url
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                    # Also scan the output dir for any new .png files
-                    cid = react_state.get("conv_id") or "default"
-                    from dbgpt.configs.model_config import PILOT_PATH
-
-                    out_dir = os.path.join(PILOT_PATH, "tmp", cid)
-                    if os.path.isdir(out_dir):
-                        for fname in os.listdir(out_dir):
-                            ext = os.path.splitext(fname)[1].lower()
-                            if ext in IMAGE_EXTS:
-                                abs_path = os.path.join(out_dir, fname)
-                                orig_stem = os.path.splitext(fname)[0].lower()
-                                if orig_stem not in react_state.get(
-                                    "image_url_map", {}
-                                ):
-                                    unique_name = f"{uuid.uuid4().hex[:8]}_{fname}"
-                                    dest = os.path.join(
-                                        STATIC_MESSAGE_IMG_PATH, unique_name
-                                    )
-                                    shutil.copy2(abs_path, dest)
-                                    img_url = f"/images/{unique_name}"
-                                    react_state.setdefault(
-                                        "generated_images", []
-                                    ).append(img_url)
-                                    react_state.setdefault("image_url_map", {})[
-                                        orig_stem
-                                    ] = img_url
-                    # Append image URL summary for LLM reference
-                    all_images = react_state.get("generated_images", [])
-                    if all_images:
-                        img_summary = (
-                            "\u5df2\u751f\u6210\u7684\u56fe\u7247URL\uff08\u5728\u751f\u6210HTML\u62a5\u544a\u65f6\u8bf7\u4f7f\u7528\u8fd9\u4e9bURL\uff09:\n"
-                            + "\n".join(f"  - {url}" for url in all_images)
-                        )
-                        chunks.append({"output_type": "text", "content": img_summary})
-                    logger.info(
-                        "shell_interpreter: captured %d images for skill script",
-                        len(react_state.get("image_url_map", {})),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "shell_interpreter: image post-processing failed: %s", e
-                    )
-
-        return json.dumps({"chunks": chunks}, ensure_ascii=False)
-
-    @tool(
-        description="执行技能scripts目录下的脚本文件。参数: "
-        '{"skill_name": "技能名称", "script_file_name": "脚本文件名", "args": {参数}}'
-    )
-    async def execute_skill_script_file(
-        skill_name: str, script_file_name: str, args: Optional[dict] = None
-    ) -> str:
-        """Execute a script file from a skill's scripts directory.
-
-        After execution, any new image files (.png, .jpg, etc.) generated
-        by the script are automatically copied to the static images directory
-        and their URLs are returned in the output chunks.
-        """
-        import shutil
-        import uuid
-
-        from dbgpt.agent.skill.manage import get_skill_manager
-        from dbgpt.configs.model_config import STATIC_MESSAGE_IMG_PATH
-
-        try:
-            from dbgpt.configs.model_config import PILOT_PATH
-
-            sm = get_skill_manager(CFG.SYSTEM_APP)
-            cid = react_state.get("conv_id") or "default"
-            out_dir = os.path.join(PILOT_PATH, "tmp", cid)
-            os.makedirs(out_dir, exist_ok=True)
-            # Auto-inject the correct file path from react_state into args.
-            # The LLM sometimes corrupts the uploaded file path (e.g. changing
-            # 'dbgpt-app' to 'dbgpt_app'), so we override any file-path-like
-            # keys in args with the known-good path from react_state.
-            real_file_path = react_state.get("file_path")
-            if real_file_path and args:
-                _FILE_PATH_KEYS = {
-                    "input_file",
-                    "file_path",
-                    "data_path",
-                    "csv_path",
-                    "excel_path",
-                    "data_file",
-                }
-                for key in list(args.keys()):
-                    if key in _FILE_PATH_KEYS:
-                        args[key] = real_file_path
-            result_str = await sm.execute_skill_script_file(
-                skill_name,
-                script_file_name,
-                args or {},
-                output_dir=out_dir,
-            )
-
-            # Read script source code and prepend as a 'code' chunk
-            # so the frontend can display it in the left pane.
-            try:
-                _skill_path = sm._get_skill_path(skill_name)
-                _sf = script_file_name.lstrip("/\\")
-                if _sf.startswith("scripts/") or _sf.startswith("scripts\\"):
-                    _sf = _sf[8:]
-                _script_abs = os.path.join(_skill_path, "scripts", _sf)
-                with open(_script_abs, "r", encoding="utf-8") as _f:
-                    _script_source = _f.read()
-            except Exception:
-                _script_source = None
-
-            # Post-process: copy image files to static dir and replace
-            # absolute paths with /images/ URLs.
-            try:
-                result_obj = json.loads(result_str)
-                chunks = result_obj.get("chunks", [])
-                # Prepend script source code as a 'code' chunk
-                if _script_source:
-                    chunks.insert(
-                        0,
-                        {
-                            "output_type": "code",
-                            "content": _script_source,
-                        },
-                    )
-                os.makedirs(STATIC_MESSAGE_IMG_PATH, exist_ok=True)
-                IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
-                for chunk in chunks:
-                    if chunk.get("output_type") == "image":
-                        abs_path = chunk["content"]
-                        if os.path.isabs(abs_path) and os.path.isfile(abs_path):
-                            ext = os.path.splitext(abs_path)[1].lower()
-                            if ext in IMAGE_EXTS:
-                                unique_name = (
-                                    f"{uuid.uuid4().hex[:8]}_"
-                                    f"{os.path.basename(abs_path)}"
-                                )
-                                dest = os.path.join(
-                                    STATIC_MESSAGE_IMG_PATH, unique_name
-                                )
-                                shutil.copy2(abs_path, dest)
-                                img_url = f"/images/{unique_name}"
-                                chunk["content"] = img_url
-                                react_state.setdefault("generated_images", []).append(
-                                    img_url
-                                )
-                                # Also store a map: original filename (no ext)
-                                # -> served URL for template placeholder
-                                # resolution.
-                                orig_stem = os.path.splitext(
-                                    os.path.basename(abs_path)
-                                )[0].lower()
-                                react_state.setdefault("image_url_map", {})[
-                                    orig_stem
-                                ] = img_url
-
-                # Append image URL summary for LLM reference
-                all_images = react_state.get("generated_images", [])
-                if all_images:
-                    img_summary = (
-                        "已生成的图片URL（在生成HTML报告时请使用这些URL）:\n"
-                        + "\n".join(f"  - {url}" for url in all_images)
-                    )
-                    chunks.append({"output_type": "text", "content": img_summary})
-                auto_data = react_state.get("auto_data")
-                if not isinstance(auto_data, dict):
-                    auto_data = {}
-                    react_state["auto_data"] = auto_data
-                filtered_chunks = []
-                for chunk in chunks:
-                    if chunk.get("output_type") != "text":
-                        filtered_chunks.append(chunk)
-                        continue
-                    content = chunk.get("content") or ""
-                    cleaned, extracted = _extract_auto_data_markers(content)
-                    if extracted:
-                        auto_data.update(extracted)
-                        logger.info(
-                            "execute_skill_script_file: captured auto_data keys=%s",
-                            sorted(extracted.keys()),
-                        )
-                    if cleaned:
-                        chunk["content"] = cleaned
-                        filtered_chunks.append(chunk)
-                    elif not extracted:
-                        filtered_chunks.append(chunk)
-                chunks = filtered_chunks
-
-                # Compatibility path for existing financial-report skill.
-                if script_file_name == "calculate_ratios.py":
-                    for chunk in chunks:
-                        if chunk.get("output_type") == "text":
-                            try:
-                                ratio_data = json.loads(chunk["content"])
-                                react_state["ratio_data"] = ratio_data
-                            except Exception:
-                                pass
-                return json.dumps({"chunks": chunks}, ensure_ascii=False)
-            except (json.JSONDecodeError, KeyError):
-                return result_str
-        except Exception as e:
-            return json.dumps(
-                {"chunks": [{"output_type": "text", "content": f"Error: {str(e)}"}]},
-                ensure_ascii=False,
-            )
-
-    @tool(
-        description="将 HTML 渲染为可交互的网页报告，这是向用户展示网页报告的唯一方式。"
-        "【默认用法】直接传入完整的 HTML 字符串："
-        '{"html": "<html>...</html>", "title": "报告标题"}。'
-        "你需要自己生成完整的 HTML 代码"
-        "（包含 <!DOCTYPE html>、<html>、<head>、<body> 等），"
-        "然后传给 html 参数即可。"
-        "HTML 可以很长，没有长度限制，不需要分段传入。"
-        "【禁止】不要用 code_interpreter 写 HTML 再 print，"
-        "不要用 code_interpreter 把 HTML 写入文件再读取，"
-        "直接把 HTML 传给本工具即可。"
-        "【技能模式 - 仅在使用技能时可选】如果正在使用技能（skill），可以用模板模式："
-        '{"template_path": "技能名/templates/模板.html", '
-        '"data": {"KEY": "值"}, "title": "标题"}。'
-        '也可以用文件模式：{"file_path": "/path/to/report.html"}'
-    )
-    async def html_interpreter(
-        html: str = "",
-        title: str = "Report",
-        file_path: str = "",
-        template_path: str = "",
-        data: dict | str = None,
-    ) -> str:
-        """Render HTML as an interactive web report.
-
-        Default usage: pass a complete HTML string via the `html` parameter.
-        The HTML can be arbitrarily long — no length limit, no chunking needed.
-
-        Skill template mode (optional): pass `template_path` (relative to skills
-        dir) plus a `data` dict whose keys match {{PLACEHOLDER}} tokens in the
-        template. The backend reads the template and performs all replacements.
-
-        Legacy fallback: `file_path` reads HTML from a file on disk.
-        """
-        import re
-
-        from dbgpt.configs.model_config import STATIC_MESSAGE_IMG_PATH
-
-        # ── Mode 1: template_path + data ──────────────────────────────
-        if template_path and template_path.strip():
-            tp = template_path.strip()
-            skills_dir = Path(DEFAULT_SKILLS_DIR).expanduser().resolve()
-            target = (skills_dir / tp).resolve()
-            # Security: must be under skills_dir
-            try:
-                target.relative_to(skills_dir)
-            except ValueError:
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "output_type": "text",
-                                "content": f"Invalid template_path: {tp}",
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            if not target.is_file():
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "output_type": "text",
-                                "content": (
-                                    f"Template not found: {tp}. "
-                                    "This skill does not have HTML templates. "
-                                    "Please retry by calling html_interpreter "
-                                    "with the `html` parameter instead — "
-                                    "generate the complete HTML report code "
-                                    "yourself and pass it directly via "
-                                    '{"html": "<html>...</html>", '
-                                    '"title": "report title"}.'
-                                ),
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            try:
-                raw_template = target.read_text(encoding="utf-8")
-            except Exception as e:
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "output_type": "text",
-                                "content": f"Error reading template: {e}",
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            # Replace {{KEY}} placeholders with values from data dict
-            # Sometimes the LLM passes data as a JSON string instead of a dict
-            replacements = data
-            if isinstance(replacements, str):
-                try:
-                    replacements = json.loads(replacements)
-                except Exception as e:
-                    logger.warning(
-                        f"html_interpreter failed to parse string data as json: {e}"
-                    )
-                    # Attempt to fix truncated JSON by appending closing
-                    # braces/quotes
-                    try:
-                        fixed = str(replacements).rstrip()
-                        if not fixed.endswith("}"):
-                            if fixed.endswith('"'):
-                                fixed += "}"
-                            else:
-                                fixed += '"}'
-                        replacements = json.loads(fixed)
-                    except Exception:
-                        replacements = {}
-            if not isinstance(replacements, dict):
-                replacements = {}
-            auto_data = react_state.get("auto_data", {})
-            if isinstance(auto_data, dict):
-                replacements = {**auto_data, **replacements}
-
-            # Merge LLM replacements with ratio_data from calculate_ratios.py
-            ratio_data = react_state.get("ratio_data", {})
-            if isinstance(ratio_data, dict):
-                # auto_data / LLM data overwrites ratio_data if keys overlap
-                merged = {**ratio_data, **replacements}
-                replacements = merged
-
-            # Auto-resolve CHART_* placeholders from generated images.
-            # image_url_map: {
-            #     "financial_overview": "/images/abc_financial_overview.png"
-            # }
-            # Template uses:
-            #     {{CHART_FINANCIAL_OVERVIEW}}
-            #     -> /images/abc_financial_overview.png
-            image_url_map = react_state.get("image_url_map", {})
-            if isinstance(image_url_map, dict):
-                for stem, url in image_url_map.items():
-                    chart_key = f"CHART_{stem.upper()}"
-                    if chart_key not in replacements:
-                        replacements[chart_key] = url
-
-            def _replace_placeholder(m):
-                key = m.group(1)
-                return str(replacements.get(key, ""))
-
-            html = re.sub(r"\{\{([A-Z_0-9]+)\}\}", _replace_placeholder, raw_template)
-            if not title or title == "Report":
-                title = target.stem
-            logger.info(
-                "html_interpreter: template=%s, %d placeholders replaced, "
-                "html=%d chars",
-                tp,
-                len(replacements),
-                len(html),
-            )
-
-        # ── Mode 2: file_path ─────────────────────────────────────────
-        elif file_path and file_path.strip():
-            fp = file_path.strip()
-            if not os.path.isfile(fp):
-                cid = react_state.get("conv_id") or "default"
-                from dbgpt.configs.model_config import PILOT_PATH
-
-                alt = os.path.join(PILOT_PATH, "data", cid, os.path.basename(fp))
-                if os.path.isfile(alt):
-                    fp = alt
-                else:
-                    return json.dumps(
-                        {
-                            "chunks": [
-                                {
-                                    "output_type": "text",
-                                    "content": f"File not found: {file_path}",
-                                }
-                            ]
-                        },
-                        ensure_ascii=False,
-                    )
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    html = f.read()
-                if not title or title == "Report":
-                    title = os.path.splitext(os.path.basename(fp))[0]
-                logger.info(
-                    "html_interpreter: read %d chars from file %s",
-                    len(html),
-                    fp,
-                )
-            except Exception as e:
-                return json.dumps(
-                    {
-                        "chunks": [
-                            {
-                                "output_type": "text",
-                                "content": f"Error reading file: {e}",
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-
-        # ── Mode 3: inline html ──────────────────────────────────────
-        # Unescape literal \n sequences that LLM may produce.
-        # IMPORTANT: Only apply this unescape when html was provided directly
-        # (inline mode).  Template mode (Mode 1) and file mode (Mode 2) produce
-        # real HTML that already contains actual newlines and may contain JS
-        # regex literals like /\\n/ which must NOT be collapsed into real
-        # newlines — doing so corrupts the JS and breaks chart rendering.
-        if html and isinstance(html, str) and not template_path and not file_path:
-            if "\\n" in html:
-                html = html.replace("\\n", "\n")
-            if "\\t" in html:
-                html = html.replace("\\t", "\t")
-        if not html or not html.strip():
-            return json.dumps(
-                {
-                    "chunks": [
-                        {
-                            "output_type": "text",
-                            "content": "No HTML content provided",
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-        # Post-process: fix image URLs that the LLM may have guessed wrong.
-        # Files in STATIC_MESSAGE_IMG_PATH are named "{uuid8}_{original}.ext".
-        # The LLM might reference "/images/original.ext" (without UUID prefix)
-        # or even just "original.ext".  Build a lookup and replace.
-        fixed_html = html.strip()
-        try:
-            IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
-            # Map: lowercase base name (without uuid prefix) -> served path
-            # e.g. "monthly_sales_trend.png"
-            #      -> "/images/a1b2c3ff_monthly_sales_trend.png"
-            name_to_served: Dict[str, str] = {}
-            if os.path.isdir(STATIC_MESSAGE_IMG_PATH):
-                for fname in os.listdir(STATIC_MESSAGE_IMG_PATH):
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext not in IMAGE_EXTS:
-                        continue
-                    # Strip the 8-char hex UUID prefix + underscore
-                    # Pattern: <8 hex chars>_<original_name>
-                    m = re.match(r"^[0-9a-f]{8}_(.+)$", fname, re.IGNORECASE)
-                    if m:
-                        base_name = m.group(1).lower()
-                        served_path = f"/images/{fname}"
-                        # Keep the latest (last alphabetically = most recent
-                        # UUID)
-                        name_to_served[base_name] = served_path
-
-            if name_to_served:
-                # Replace patterns like:
-                #   src="/images/monthly_sales_trend.png"
-                #   src="images/monthly_sales_trend.png"
-                #   src="monthly_sales_trend.png"
-                # with the correct served path.
-                def _fix_img_src(match: re.Match) -> str:
-                    prefix = match.group(1)  # src=" or src='
-                    raw_path = match.group(2)  # the path value
-                    quote = match.group(3)  # closing quote
-
-                    # Extract just the filename from the path
-                    filename = raw_path.rsplit("/", 1)[-1].lower()
-
-                    # Check if it's already a correct served path
-                    if re.match(r"^[0-9a-f]{8}_.+$", filename, re.IGNORECASE):
-                        return match.group(0)  # Already has UUID prefix
-
-                    if filename in name_to_served:
-                        return f"{prefix}{name_to_served[filename]}{quote}"
-                    return match.group(0)  # No match, keep original
-
-                # Match src="..." or src='...' containing image references
-                fixed_html = re.sub(
-                    r"""(src\s*=\s*["'])"""
-                    r"""([^"']+\.(?:png|jpg|jpeg|gif|svg|webp))"""
-                    r"""(["'])""",
-                    _fix_img_src,
-                    fixed_html,
-                    flags=re.IGNORECASE,
-                )
-        except Exception:
-            pass  # If post-processing fails, use original HTML
-
-        # Auto-append images generated during this session that the LLM
-        # forgot to include in the HTML.
-        try:
-            gen_images = react_state.get("generated_images", [])
-            if gen_images:
-                # Extract all image filenames already referenced in the HTML
-                # (e.g. "time_series_trend.png" from any src="...time_series_trend.png")
-                html_img_stems = set(
-                    re.sub(r"^[0-9a-f]+_", "", os.path.basename(src))
-                    for src in re.findall(
-                        r'<img[^>]+src=["\']([^"\']+)["\']', fixed_html, re.IGNORECASE
-                    )
-                )
-
-                # An image is "missing" only when neither its exact URL nor its
-                # stem (filename with UUID prefix stripped) is already covered.
-                def _img_stem(url):
-                    return re.sub(r"^[0-9a-f]+_", "", os.path.basename(url))
-
-                missing = [
-                    url
-                    for url in gen_images
-                    if url not in fixed_html and _img_stem(url) not in html_img_stems
-                ]
-                if missing:
-                    imgs_html = "".join(
-                        f'<div style="margin:16px 0">'
-                        f'<img src="{url}" '
-                        f'style="max-width:100%;height:auto;'
-                        f'border-radius:8px">'
-                        f"</div>"
-                        for url in missing
-                    )
-                    section = (
-                        '<div style="margin-top:32px">'
-                        "<h2>📊 分析图表</h2>"
-                        f"{imgs_html}</div>"
-                    )
-                    # Insert before </body> if present, otherwise append
-                    if "</body>" in fixed_html.lower():
-                        fixed_html = re.sub(
-                            r"(</body>)",
-                            section + r"\1",
-                            fixed_html,
-                            count=1,
-                            flags=re.IGNORECASE,
-                        )
-                    else:
-                        fixed_html += section
-        except Exception:
-            pass
-
-        chunks: List[Dict[str, Any]] = [
-            {"output_type": "html", "content": fixed_html, "title": title},
-        ]
-        return json.dumps({"chunks": chunks}, ensure_ascii=False)
-
-    llm_client = DefaultLLMClient(
-        CFG.SYSTEM_APP.get_component(
-            ComponentType.WORKER_MANAGER_FACTORY, WorkerManagerFactory
-        ).create(),
-        auto_convert_message=True,
-    )
-    # If user specified a model_name, use Priority strategy to ensure the
-    # agent uses the requested model instead of picking the first available one.
-    if dialogue.model_name:
-        llm_config = LLMConfig(
-            llm_client=llm_client,
-            llm_strategy=LLMStrategyType.Priority,
-            strategy_context=json.dumps([dialogue.model_name]),
-        )
-    else:
-        llm_config = LLMConfig(llm_client=llm_client)
-
-    conv_id = dialogue.conv_uid or str(uuid.uuid4())
-    react_state["conv_id"] = conv_id
-    if conv_id in REACT_AGENT_MEMORY_CACHE:
-        gpt_memory = REACT_AGENT_MEMORY_CACHE[conv_id]
-    else:
-        gpt_memory = GptsMemory(
-            plans_memory=DefaultGptsPlansMemory(),
-            message_memory=MetaDbGptsMessageMemory(),
-        )
-        gpt_memory.init(conv_id, enable_vis_message=False)
-        REACT_AGENT_MEMORY_CACHE[conv_id] = gpt_memory
-    agent_memory = AgentMemory(gpts_memory=gpt_memory)
-
-    # --- Persist conversation to chat_history for sidebar display ---
-    conv_serve = ConversationServe.get_instance(CFG.SYSTEM_APP)
-    storage_conv = StorageConversation(
-        conv_uid=conv_id,
-        chat_mode=dialogue.chat_mode or "chat_react_agent",
-        user_name=dialogue.user_name,
-        sys_code=dialogue.sys_code,
-        summary=dialogue.user_input,
-        app_code=dialogue.app_code,
-        conv_storage=conv_serve.conv_storage,
-        message_storage=conv_serve.message_storage,
-    )
-    storage_conv.save_to_storage()
-    storage_conv.start_new_round()
-    storage_conv.add_user_message(user_input)
-    context = AgentContext(
-        conv_id=conv_id,
-        gpts_app_code="react_agent",
-        gpts_app_name="ReAct",
-        language="zh",
-        temperature=dialogue.temperature or 0.2,
-        enable_context_management=True,
-    )
-
-    # Build file context if file uploaded
-    file_context = ""
-    if file_path:
-        file_context = f"""
-## User Uploaded File
-- File path: {file_path}
-- Analyze this file if needed for the user's request.
-"""
-
-    # Build skill context for system prompt when skill is pre-selected
-    skill_prompt_context = ""
-    execution_instruction = ""
-    if pre_matched_skill and react_state.get("skill_prompt"):
-        skill_template = react_state["skill_prompt"]
-        skill_text = (
-            skill_template.template
-            if hasattr(skill_template, "template")
-            else str(skill_template)
-        )
-        skill_prompt_context = f"""
-## 已加载技能指令（{pre_matched_skill.metadata.name}）
-以下是用户选择的技能的完整指令，请严格按照这些指令进行操作：
-
-{skill_text}
-"""
-        execution_instruction = f"""
-## 执行要求
-1. 用户已明确选择技能：{pre_matched_skill.metadata.name}
-2. 你必须严格按照上述技能指令的步骤执行
-3. 阅读技能指令，理解每一步需要调用的工具
-4. 按顺序执行工具调用，完成技能目标
-"""
-
-    # ── TodoWrite tool ──────────────────────────────────────────────────
-    # A session-level task list that the agent maintains.  The full list is
-    # replaced on every call (same semantics as OpenCode's todowrite).
-    # The tool pushes a ``plan.update`` SSE event so the frontend can
-    # render a live task-plan card.
-    _todo_list: List[Dict[str, str]] = []
-
-    @tool(
-        description=(
-            "Create and manage a structured task list for the current session. "
-            "Use this tool to plan complex tasks (3+ steps), track progress, "
-            "and show the user what you are doing. "
-            "Pass the FULL todo list every time (not incremental). "
-            "Each todo has: content (brief description), "
-            "status (pending | in_progress | completed | cancelled), "
-            "priority (high | medium | low). "
-            "Rules: only ONE task in_progress at a time; mark tasks completed "
-            "immediately after finishing; do NOT use for single trivial tasks."
-            '\nParameter: {"todos": [{"content": "...", "status": "...", '
-            '"priority": "..."}]}'
-        )
-    )
-    def todowrite(todos: str) -> str:
-        """Update the session todo list (full replacement)."""
-        import json as _json
-
-        parsed: List[Dict[str, str]] = []
-        try:
-            raw = _json.loads(todos) if isinstance(todos, str) else todos
-            items = raw if isinstance(raw, list) else raw.get("todos", raw)
-            if isinstance(items, list):
-                for item in items:
-                    parsed.append(
-                        {
-                            "content": str(item.get("content", "")),
-                            "status": str(item.get("status", "pending")),
-                            "priority": str(item.get("priority", "medium")),
-                        }
-                    )
-        except Exception:
-            return _json.dumps(
-                {
-                    "chunks": [
-                        {
-                            "output_type": "text",
-                            "content": "Error: invalid todos JSON",
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-        _todo_list.clear()
-        _todo_list.extend(parsed)
-
-        total = len(parsed)
-        done = sum(1 for t in parsed if t["status"] == "completed")
-        return _json.dumps(
-            {
-                "chunks": [
-                    {
-                        "output_type": "text",
-                        "content": f"Todo list updated: {done}/{total} completed",
-                    }
-                ],
-                # Attach the todo list so SSE handler can forward it
-                "__todos__": parsed,
-            },
-            ensure_ascii=False,
-        )
-
     _todo_action_history: Dict[int, List[str]] = {}
 
     def _active_todo_index() -> Optional[int]:
@@ -3779,6 +3086,120 @@ print(json.dumps(summary, ensure_ascii=False))
 
         return list(_todo_list) if changed else None
 
+    llm_client = DefaultLLMClient(
+        CFG.SYSTEM_APP.get_component(
+            ComponentType.WORKER_MANAGER_FACTORY, WorkerManagerFactory
+        ).create(),
+        auto_convert_message=True,
+    )
+    if dialogue.model_name:
+        llm_config = LLMConfig(
+            llm_client=llm_client,
+            llm_strategy=LLMStrategyType.Priority,
+            strategy_context=json.dumps([dialogue.model_name]),
+        )
+    else:
+        llm_config = LLMConfig(llm_client=llm_client)
+
+    conv_id = dialogue.conv_uid or str(uuid.uuid4())
+    react_state["conv_id"] = conv_id
+    if attachment_ctx is not None:
+        # Public manifests for runtime tools plus the internal primary
+        # materialized path / files_json mapping (execution-only values —
+        # never written to prompts, logs or history).
+        react_state.update(react_state_patch(attachment_ctx))
+    # Public per-turn snapshot of input files for the persisted history
+    # payload (v2). Only public metadata — never server paths, storage URIs,
+    # owner ids, hashes or inspection bodies. Later turns resolve files
+    # fresh from the registry; old payloads are never scanned for files.
+    input_files_snapshot = build_input_files_v2(
+        attachment_ctx.manifests if attachment_ctx is not None else ()
+    )
+    if conv_id in REACT_AGENT_MEMORY_CACHE:
+        gpt_memory = REACT_AGENT_MEMORY_CACHE[conv_id]
+    else:
+        gpt_memory = GptsMemory(
+            plans_memory=DefaultGptsPlansMemory(),
+            message_memory=MetaDbGptsMessageMemory(),
+        )
+        gpt_memory.init(conv_id, enable_vis_message=False)
+        REACT_AGENT_MEMORY_CACHE[conv_id] = gpt_memory
+    agent_memory = AgentMemory(gpts_memory=gpt_memory)
+
+    conv_serve = ConversationServe.get_instance(CFG.SYSTEM_APP)
+    storage_conv = StorageConversation(
+        conv_uid=conv_id,
+        chat_mode=dialogue.chat_mode or "chat_react_agent",
+        user_name=dialogue.user_name,
+        sys_code=dialogue.sys_code,
+        summary=dialogue.user_input,
+        app_code=dialogue.app_code,
+        conv_storage=conv_serve.conv_storage,
+        message_storage=conv_serve.message_storage,
+    )
+    storage_conv.save_to_storage()
+    storage_conv.start_new_round()
+    # Load the full conversation history (user question + agent final answer)
+    # before appending the current round, then pass it as historical_dialogues
+    # so multi-turn follow-ups see the previous Q&A (mirrors hermes'
+    # conversation_history passed into the loop).
+    historical_dialogues: List[AgentMessage] = []
+    for _msg in storage_conv.get_history_message():
+        if _msg.type == "human":
+            historical_dialogues.append(AgentMessage(content=_msg.content))
+        elif _msg.type == "ai":
+            historical_dialogues.append(AgentMessage(content=_msg.content))
+        elif _msg.type == "view":
+            # view 消息存的是 history_payload(JSON)，提取 final_content 作为 AI 回答
+            _content = _msg.content
+            try:
+                _payload = (
+                    json.loads(_content) if isinstance(_content, str) else _content
+                )
+                if isinstance(_payload, dict):
+                    _content = _payload.get("final_content") or ""
+            except Exception:
+                pass
+            if _content:
+                historical_dialogues.append(AgentMessage(content=_content))
+    storage_conv.add_user_message(user_input)
+    context = AgentContext(
+        conv_id=conv_id,
+        gpts_app_code="react_agent",
+        gpts_app_name="ReAct",
+        language="zh",
+        temperature=dialogue.temperature or 0.2,
+        enable_context_management=True,
+        enable_native_function_calling=True,
+    )
+
+    # file_ids requests use the public manifest block; legacy file_path and
+    # pure-text requests keep their existing wording byte-for-byte.
+    file_context = build_file_context(attachment_ctx, file_path)
+
+    skill_prompt_context = ""
+    execution_instruction = ""
+    if pre_matched_skill and react_state.get("skill_prompt"):
+        skill_template = react_state["skill_prompt"]
+        skill_text = (
+            skill_template.template
+            if hasattr(skill_template, "template")
+            else str(skill_template)
+        )
+        skill_prompt_context = f"""
+## 已加载技能指令（{pre_matched_skill.metadata.name}）
+以下是用户选择的技能的完整指令，请严格按照这些指令进行操作：
+
+{skill_text}
+"""
+        execution_instruction = f"""
+## 执行要求
+1. 用户已明确选择技能：{pre_matched_skill.metadata.name}
+2. 你必须严格按照上述技能指令的步骤执行
+3. 阅读技能指令，理解每一步需要调用的工具
+4. 按顺序执行工具调用，完成技能目标
+"""
+
     # Build a hint listing all images currently available in
     # STATIC_MESSAGE_IMG_PATH so the LLM can reference them correctly in
     # html_interpreter.
@@ -3793,6 +3214,7 @@ print(json.dumps(summary, ensure_ascii=False))
 
     # Inject connector tools — only the ones the user explicitly selected.
     connector_tool_extras: List[Any] = []
+    _connector_manager = None
     try:
         from dbgpt.agent.resource.connector.manager import (
             ConnectorManager as _ConnectorManager,
@@ -3877,6 +3299,36 @@ Action Input: JSON tool parameters
 
         tool_pack = ToolPack([sql_query, Terminate()])
     elif is_skill_mode:
+    # Parallel sub-agent dispatch is exposed only in the full-tool branch
+    # below. It shares the main stream queue so child lifecycle events and
+    # question events use the same ordered SSE channel.
+    _max_parallel_subagents = 3
+    try:
+        _app_cfg = CFG.SYSTEM_APP.config.configs.get("app_config")
+        _web_cfg = getattr(getattr(_app_cfg, "service", None), "web", None)
+        _agent_ctx = getattr(_web_cfg, "agent_context", None)
+        _cfg_val = getattr(_agent_ctx, "max_parallel_subagents", None)
+        if isinstance(_cfg_val, int) and _cfg_val > 0:
+            _max_parallel_subagents = _cfg_val
+    except Exception:
+        logger.debug("Failed to read max_parallel_subagents; using default 3")
+
+    async def _emit_subagent_event(payload: Dict[str, Any]) -> None:
+        await stream_queue.put(payload)
+
+    dispatch_parallel_tasks = make_dispatch_tool(
+        parent_conv_id=conv_id,
+        llm_client=llm_client,
+        sub_model_name=dialogue.model_name,
+        database_connector=database_connector,
+        knowledge_resources=knowledge_resources,
+        connector_tool_extras=connector_tool_extras,
+        connector_manager=_connector_manager,
+        emit_event=_emit_subagent_event,
+        max_parallel=_max_parallel_subagents,
+    )
+
+    if is_skill_mode:
         # Simplified prompt for skill mode - only skill-related tools +
         # html_interpreter
         workflow_prompt = f"""
@@ -3976,6 +3428,14 @@ The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
 8. **terminate**: Return the final answer when the task is completed. Action Input
 must be {{"output": "your final answer content"}}.
+8. **question**: Ask the user a question and wait for their response. Use this tool
+   when you need user input, clarification, or a decision to proceed. The tool blocks
+   until the user answers.
+   Parameters: {{"questions": [{{"question": "...", "header": "...", "options": [
+   {{"label": "...", "description": "..."}}, ...]}}]}}. Set multiple=true to allow
+   multiple selections. The tool returns the user's selected answers.
+9. **terminate**: Return the final answer when the task is completed. Action Input
+must be {{"result": "your final answer content"}}.
 
 ## Task Management
 For complex tasks that require 3 or more steps, use the `todowrite` tool to create
@@ -4011,24 +3471,68 @@ Action Reason: Why this action is needed now, plain text, MUST be concise and fi
 Do not use ellipsis.
 Action: The selected tool name (must be one of the tools listed above)
 Action Input: The JSON format of tool parameters
+
+IMPORTANT: Never emit native tool-call markup such as
+<|tool_calls_section_begin|>, <|tool_call_begin|>, <|tool_call_argument_begin|>
+or any other <|...|> tokens. Tool calls are ONLY valid in the textual
+Thought/Action/Action Input format shown above.
 """.strip()
 
-        tool_pack = ToolPack(
-            [
-                execute_skill_script,
-                get_skill_resource,
-                execute_skill_script_file,
-                shell_interpreter,
-                html_interpreter,
-                sql_query,
-                todowrite,
-                Terminate(),
-            ]
-            + business_tools
-            + connector_tool_extras
-        )
+        if tool_mode == "knowledge":
+            # Knowledge-chat mode: only kb tools + todowrite + terminate.
+            # No skill/shell/sql/html/code tools to keep the agent focused.
+            tool_pack = ToolPack(
+                [todowrite_tool, question_tool, Terminate()]
+                + business_tools
+                + connector_tool_extras
+            )
+        else:
+            tool_pack = ToolPack(
+                [
+                    execute_skill_script,
+                    get_skill_resource,
+                    execute_skill_script_file_tool,
+                    shell_interpreter_tool,
+                    html_interpreter_tool,
+                    sql_query_tool,
+                    todowrite_tool,
+                    question_tool,
+                    Terminate(),
+                ]
+                + business_tools
+                + connector_tool_extras
+            )
     else:
         # Full prompt with all tools when no skill is pre-selected
+        codegraph_section = (
+            "13.1. **kb_codegraph_explore**: Query the code knowledge graph for "
+            "structural info (classes, call chains, inheritance).\n"
+            'Parameters: {"query": "class/function name or \'who calls X\'"}\n'
+            "13.2. **kb_codegraph_call_chain**: Trace callers/callees of a function.\n"
+            'Parameters: {"function_name": "function name", "depth": 2, '
+            '"direction": "callers or callees"}\n'
+            "13.3. **kb_codegraph_class_hierarchy**: Trace class inheritance and "
+            "implementations.\n"
+            'Parameters: {"class_name": "class or interface name"}\n'
+            if code_graph_available
+            else ""
+        )
+        wiki_section = (
+            "13.4. **kb_wiki_search**: Search this space's auto-generated "
+            "LLM-Wiki pages (curated, synthesized knowledge).\n"
+            'Parameters: {"query": "search keywords"}\n'
+            "13.5. **kb_wiki_read_page**: Read one wiki page by slug; use "
+            "slug 'index' for the auto-generated catalog page.\n"
+            'Parameters: {"slug": "page slug like entity/xxx or index"}\n'
+            "13.6. **kb_wiki_index**: List the wiki catalog (folders and "
+            "pages with one-line summaries).\n"
+            "Parameters: none\n"
+            "13.7. Prefer kb_wiki_* when the question is about the space's "
+            "overall knowledge structure; prefer semantic_search/kb_grep "
+            "when you need to quote raw source documents verbatim.\n"
+            if wiki_available
+            else ""
+        )
         workflow_prompt = f"""
 You are the DB-GPT intelligent assistant, capable of autonomously selecting tools
 to solve problems based on user tasks.
@@ -4057,6 +3561,15 @@ a structured task plan BEFORE starting work. This helps users track your progres
 - Mark exactly ONE task as `in_progress` at a time.
 - Mark tasks `completed` immediately after finishing each one.
 - Do NOT use todowrite for simple single-step tasks.
+- Parallel exception: when the task contains 2 or more mutually independent
+  subtasks eligible for `dispatch_parallel_tasks`, use `todowrite` even when
+  the overall task has fewer than 3 steps.
+- After splitting tasks with `todowrite`, delegate independent items with no
+  ordering dependency to `dispatch_parallel_tasks` (one sub-agent per item).
+  `todowrite` decomposes and tracks work; `dispatch_parallel_tasks` only executes
+  already-split items.
+- The "exactly one in_progress" rule controls the visible todo state; it does
+  not prevent dispatching other independent pending items in the same batch.
 
 CRITICAL: You MUST call `todowrite` to update the task list at EVERY transition:
 1. BEFORE starting a task: mark it `in_progress` (call todowrite)
@@ -4119,14 +3632,22 @@ Parameters: {{"code": "python code string"}}
 7. **load_file**: Load uploaded file info. Parameters: none.
 8. **execute_analysis**: Execute quick analysis on uploaded Excel/CSV file.
 Parameters: none.
-9. **knowledge_retrieve**: Retrieve relevant info from knowledge base.
-Parameters: {{"query": "search query"}}
-10. **sql_query**: Execute a read-only SQL query against the selected database.
+9. **kb_ls**: List files and directories in the knowledge base.
+Parameters: {{"path": "directory path (optional)"}}
+10. **kb_glob**: Search files by name or glob pattern in the knowledge base.
+Parameters: {{"pattern": "file name keyword or glob pattern"}}
+11. **kb_grep**: Search file contents by keyword in the knowledge base. Prefer for exact matches.
+Parameters: {{"query": "search keyword", "path": "directory filter (optional)", "file_pattern": "file pattern like *.py (optional)"}}
+12. **kb_cat**: Read the content of a specific file in the knowledge base.
+Parameters: {{"path": "file path like src/main.py", "start_line": "start line (optional)", "end_line": "end line (optional, 0 = to end)"}}
+13. **semantic_search**: Semantic search in the knowledge base. Use when kb_grep returns insufficient results.
+Parameters: {{"query": "search query in natural language", "top_k": "number of results (optional)"}}
+{codegraph_section}{wiki_section}14. **sql_query**: Execute a read-only SQL query against the selected database.
 Parameters: {{"sql": "SELECT statement"}}
-11. **load_tools**: Resolve required tools for the selected skill. Parameters: none.
-12. **execute_tool**: Execute a tool by name with JSON args.
+15. **load_tools**: Resolve required tools for the selected skill. Parameters: none.
+16. **execute_tool**: Execute a tool by name with JSON args.
 Parameters: {{"tool_name": "tool name", "args": {{parameters}}}}
-13. **html_interpreter**: Render HTML as an interactive web report (the ONLY way
+17. **html_interpreter**: Render HTML as an interactive web report (the ONLY way
 to display reports on the right panel). Default usage:
 {{"html": "<html>complete HTML code</html>", "title": "title"}}. Template mode:
 {{"template_path": "skill/templates/xxx.html", "data": {{...}}, "title": "title"}}.
@@ -4139,6 +3660,17 @@ IMPORTANT: You MUST call todowrite again after EACH task completes to update sta
 The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
 15. **terminate**: Finish the task. Parameters: {{"output": "final answer"}}
+15. **dispatch_parallel_tasks**: Execute 2 or more mutually independent todo
+items concurrently with isolated sub-agents. Each task needs a self-contained
+goal and may include shared context and a display title.
+Parameters: {{"tasks": [{{"goal": "...", "context": "...", "title": "..."}}]}}
+16. **question**: Ask the user a question and wait for their response. Use this tool
+   when you need user input, clarification, or a decision to proceed. The tool blocks
+   until the user answers.
+   Parameters: {{"questions": [{{"question": "...", "header": "...", "options": [
+   {{"label": "...", "description": "..."}}, ...]}}]}}. Set multiple=true to allow
+   multiple selections. The tool returns the user's selected answers.
+17. **terminate**: Finish the task. Parameters: {{"result": "final answer"}}
 
 {business_tool_descriptions}
 {file_context}
@@ -4156,26 +3688,53 @@ Action Reason: Why this action is needed now, plain text, MUST be concise and fi
 Do not use ellipsis.
 Action: The selected tool name
 Action Input: The JSON format of tool parameters
+
+IMPORTANT: Never emit native tool-call markup such as
+<|tool_calls_section_begin|>, <|tool_call_begin|>, <|tool_call_argument_begin|>
+or any other <|...|> tokens. Tool calls are ONLY valid in the textual
+Thought/Action/Action Input format shown above.
 """.strip()
 
-        tool_pack = ToolPack(
-            [
-                load_skill,
-                load_tools,
-                knowledge_retrieve,
-                execute_skill_script,
-                get_skill_resource,
-                execute_skill_script_file,
-                code_interpreter,
-                shell_interpreter,
-                html_interpreter,
-                sql_query,
-                todowrite,
-                Terminate(),
-            ]
-            + business_tools
-            + connector_tool_extras
-        )
+        workflow_prompt = workflow_prompt + "\n\n" + DISPATCH_PROMPT_SECTION
+
+        if tool_mode == "knowledge":
+            # Knowledge-chat mode (no pre-selected skill): only kb
+            # tools + todowrite + terminate.  kb_tool_list already
+            # contains kb_semantic_search, kb_ls, kb_glob, kb_grep,
+            # kb_cat and optionally codegraph tools.
+            tool_pack = ToolPack(
+                kb_tool_list
+                + [todowrite_tool, question_tool, Terminate()]
+                + business_tools
+                + connector_tool_extras
+            )
+        else:
+            tool_pack = ToolPack(
+                [
+                    load_skill_tool,
+                    load_tools_tool,
+                ]
+                + kb_tool_list
+                + [
+                    execute_skill_script,
+                    get_skill_resource,
+                    execute_skill_script_file_tool,
+                    code_interpreter_tool,
+                    load_file_tool,
+                    execute_analysis_tool,
+                    shell_interpreter_tool,
+                    html_interpreter_tool,
+                    sql_query_tool,
+                    read_file_tool,
+                    todowrite_tool,
+                    execute_tool_tool,
+                    dispatch_parallel_tasks,
+                    question_tool,
+                    Terminate(),
+                ]
+                + business_tools
+                + connector_tool_extras
+            )
 
     # Debug: print all registered tools
     logger.info(f"ToolPack resources: {list(tool_pack._resources.keys())}")
@@ -4278,6 +3837,7 @@ Action Input: The JSON format of tool parameters
     agent_max_retry_count = 6 if is_hotel_be_data_agent else 15
     agent_builder = (
         ReActAgent(max_retry_count=agent_max_retry_count)
+        ToolCallingReActAgent(max_retry_count=30)
         .bind(context)
         .bind(agent_memory)
         .bind(llm_config)
@@ -4289,7 +3849,8 @@ Action Input: The JSON format of tool parameters
 
     parser = ReActOutputParser()
     received = AgentMessage(content=user_input)
-    stream_queue: asyncio.Queue = asyncio.Queue()
+    # stream_queue and stream_callback were created earlier (before ToolPack)
+    # so that the question tool can use them.
 
     # Wire up context-management status events into the SSE stream.
     async def _context_status_callback(status: Dict[str, Any]) -> None:
@@ -4304,26 +3865,30 @@ Action Input: The JSON format of tool parameters
         on_status_event=_context_status_callback,
     )
 
-    async def stream_callback(event_type: str, payload: Dict[str, Any]) -> None:
-        await stream_queue.put({"type": event_type, **payload})
-
     async def run_agent():
         return await agent.generate_reply(
             received_message=received,
             sender=agent,
             stream_callback=stream_callback,
+            historical_dialogues=historical_dialogues,
         )
 
     agent_task = asyncio.create_task(run_agent())
+    if agent_task_holder is not None:
+        agent_task_holder.append(agent_task)
     round_step_map: Dict[int, str] = {}
     pending_thoughts: Dict[
         int, List[str]
     ] = {}  # Buffer thinking content for delayed step creation
     pending_action_intentions: Dict[int, str] = {}
     pending_action_reasons: Dict[int, str] = {}
+    # Emit a one-time "task preview" from the model's first "Plan: ..." line.
+    task_plan_emitted = False
     # --- History persistence: collect step data during streaming ---
     history_steps: List[Dict[str, Any]] = []
     current_history_step: Optional[Dict[str, Any]] = None
+    subagent_history: Dict[str, Dict[str, Any]] = {}
+    final_answer_assembler = FinalAnswerAssembler()
 
     # Emit pre-loaded skill as an SSE step before agent starts processing
     if pre_matched_skill:
@@ -4377,6 +3942,19 @@ Action Input: The JSON format of tool parameters
         event_type = event.get("type")
         if event_type == "context.status":
             # Forward context-management status to frontend as-is.
+            yield _sse_event(event)
+        elif event_type in ("question.asked", "question.replied", "question.rejected"):
+            # Forward human-in-the-loop question events to frontend as-is.
+            yield _sse_event(event)
+        elif event_type in (
+            "agent.start",
+            "agent.done",
+            "agent.step",
+            "subagent.artifacts",
+        ):
+            # Sub-agent progress uses a separate event channel so parallel
+            # child rounds cannot collide with the lead agent's round map.
+            update_subagent_history(subagent_history, event)
             yield _sse_event(event)
         elif event_type == "thinking":
             # Parse thinking content but don't create step yet
@@ -4474,6 +4052,12 @@ Action Input: The JSON format of tool parameters
                 terminate_step_event = close_terminate_step(round_step_map, round_num)
                 if terminate_step_event:
                     yield terminate_step_event
+                # derisk 参考：terminate 是「模拟 action」，不展示为真实工具 step。
+                # 通知前端移除 terminate 这轮在 thinking_chunk 阶段提前创建的
+                # 「思考中」占位 step（前端 step.meta 里 action=terminate 会过滤）。
+                if round_num in round_step_map:
+                    _stale_id = round_step_map.pop(round_num)
+                    yield step_meta(_stale_id, None, "terminate", None, "terminate")
                 # ── Auto-complete all remaining todos on terminate ──
                 if _todo_list:
                     for t in _todo_list:
@@ -4529,38 +4113,33 @@ Action Input: The JSON format of tool parameters
                     else f"TODO::{todo_state}"
                 )
 
-                # Emit or update the step card for this round
+                # Emit or update the session-level task-plan card.
                 # NOTE: Do NOT set phase — let it fall into the default
                 # "Execution Steps" group so todowrite cards appear inline
                 # alongside other action steps in chronological order.
-                if round_num in round_step_map:
-                    todo_step_id = round_step_map[round_num]
-                    yield _sse_event(
-                        {
-                            "type": "step.start",
-                            "step": step,
-                            "id": todo_step_id,
-                            "title": _todo_step_title,
-                            "detail": "todowrite",
-                            "todo_meta": todo_meta,
-                        }
-                    )
+                #
+                # The lead agent calls todowrite repeatedly (create plan,
+                # update progress, complete plan). All calls must update the
+                # same card instead of creating TODO::init/progress/done cards.
+                if _todo_step_holder:
+                    todo_step_id = _todo_step_holder[0]
                 else:
-                    todo_step_id, todo_step_event = build_step(
+                    todo_step_id, _ = build_step(
                         _todo_step_title,
                         "todowrite",
                     )
-                    round_step_map[round_num] = todo_step_id
-                    yield _sse_event(
-                        {
-                            "type": "step.start",
-                            "step": step,
-                            "id": todo_step_id,
-                            "title": _todo_step_title,
-                            "detail": "todowrite",
-                            "todo_meta": todo_meta,
-                        }
-                    )
+                    _todo_step_holder.append(todo_step_id)
+                round_step_map[round_num] = todo_step_id
+                yield _sse_event(
+                    {
+                        "type": "step.start",
+                        "step": step,
+                        "id": todo_step_id,
+                        "title": _todo_step_title,
+                        "detail": "todowrite",
+                        "todo_meta": todo_meta,
+                    }
+                )
 
                 yield _sse_event({"type": "plan.update", "tasks": todos_payload})
                 yield step_meta(
@@ -4607,13 +4186,38 @@ Action Input: The JSON format of tool parameters
                 or pending_action_intentions.pop(round_num, None)
                 or action_output.get("phase")
             )
+            # derisk-style task preview: the first action's notion/intention is a
+            # one-time "接下来要做" overview shown to the user before execution.
+            if not task_plan_emitted and action_intention:
+                task_plan_emitted = True
+                yield _sse_event(
+                    {
+                        "type": "task.preview",
+                        "content": action_intention,
+                        "round": round_num,
+                    }
+                )
             action_reason = normalize_display_text(
                 action_output.get("action_reason")
                 or pending_action_reasons.pop(round_num, None)
             )
-            display_thought = action_intention or summarize_thought(
-                thought_text or thoughts, action
+            display_thought = (
+                normalize_display_text(thoughts or thought_text) or action_intention
             )
+
+            # 解析失败轮次（如 native tool_calls 退回 XML 导致 "No valid ReAct
+            # step found"）：action 为空、无有效工具，跳过 step 展示（derisk 参考：
+            # 无效 action 不展示为噪音 step），仅清理提前创建的「思考中」占位。
+            if not action:
+                pending_thoughts.pop(round_num, [])
+                pending_action_intentions.pop(round_num, None)
+                pending_action_reasons.pop(round_num, None)
+                if round_num in round_step_map:
+                    _stale_id = round_step_map.pop(round_num)
+                    yield _sse_event(
+                        {"type": "step.done", "id": _stale_id, "status": "done"}
+                    )
+                continue
 
             # Use the actual action name as the step title (Manus-style UI)
             action_title = action or f"ReAct Round {round_num}"
@@ -4690,6 +4294,7 @@ Action Input: The JSON format of tool parameters
             observation_text = action_output.get("observations") or action_output.get(
                 "content"
             )
+            status = "done" if action_output.get("is_exe_success", True) else "failed"
             if observation_text:
                 raw_chunks = emit_tool_chunks(react_step_id, observation_text)
                 if raw_chunks:
@@ -4698,7 +4303,7 @@ Action Input: The JSON format of tool parameters
                 else:
                     for chunk in chunk_text(str(observation_text), max_len=600):
                         yield step_chunk(react_step_id, "text", chunk)
-                # --- History: collect outputs from observation ---
+                # --- History: collect the tool output for replay ---
                 if current_history_step is not None:
                     parsed_obs = None
                     if isinstance(observation_text, str):
@@ -4711,10 +4316,13 @@ Action Input: The JSON format of tool parameters
                     ):
                         for item in parsed_obs["chunks"]:
                             if isinstance(item, dict):
+                                content = item.get("content")
+                                if isinstance(content, str):
+                                    content = content.strip()
                                 current_history_step["outputs"].append(
                                     {
                                         "output_type": item.get("output_type", "text"),
-                                        "content": item.get("content"),
+                                        "content": content,
                                     }
                                 )
                     elif isinstance(observation_text, str) and observation_text:
@@ -4725,8 +4333,16 @@ Action Input: The JSON format of tool parameters
                             }
                         )
 
+                # Citations are opt-in: the assembler accepts only explicitly
+                # supported knowledge tools and fails closed on malformed data.
+                final_answer_assembler.observe(
+                    action,
+                    action_input_data,
+                    observation_text,
+                    succeeded=status == "done",
+                )
+
             # Mark step as done and track as last completed
-            status = "done" if action_output.get("is_exe_success", True) else "failed"
             yield step_done(react_step_id, status)
             if (
                 status == "done"
@@ -4765,12 +4381,65 @@ Action Input: The JSON format of tool parameters
         storage_conv.end_current_round()
         storage_conv.save_to_storage()
         for terminal_event in terminal_error_events(e):
+        err_msg = f"React agent failed: {e}"
+        fail_running_subagent_history(subagent_history)
+        error_payload = _build_react_history_payload(
+            final_content=err_msg,
+            steps=history_steps,
+            task_plan=list(_todo_list),
+            generated_images=react_state.get("generated_images", []),
+            sub_agents=build_subagent_history_snapshot(subagent_history),
+            input_files=input_files_snapshot,
+            citations=[],
+        )
+        for terminal_event in _react_terminal_events(
+            storage_conv,
+            error_payload,
+            AgentFinalAnswer(content=err_msg),
+        ):
             yield terminal_event
         return
 
     if reply.action_report and reply.action_report.terminate:
         raw_content = reply.action_report.content or ""
         final_content = _extract_terminate_output(raw_content, parser)
+        # The terminate ActionOutput.content may be the raw ReAct text, e.g.:
+        # "Thought: ...\nAction: terminate\nAction Input: {"result": "..."}"
+        # We need to extract the "result" value from Action Input.
+        final_content = raw_content
+        try:
+            steps = parser.parse(raw_content)
+            if steps:
+                action_input = steps[0].action_input
+                if action_input:
+                    # action_input could be a string like '{"result": "..."}';
+                    # tolerate trailing artifacts after the JSON object (the
+                    # parser already strips known special tokens, this is the
+                    # second line of defense for unknown ones).
+                    if isinstance(action_input, str):
+                        parsed_input = parse_or_raise_error(action_input)
+                    else:
+                        parsed_input = action_input
+                    if isinstance(parsed_input, dict) and "result" in parsed_input:
+                        final_content = parsed_input["result"]
+        except Exception:
+            pass
+        # native function calling 路径：terminate content 可能是 {"result":...}
+        # (JSON) 或 {'result':...} (Python dict repr)，直接提取 result。
+        if final_content == raw_content:
+            try:
+                _parsed = json.loads(raw_content)
+                if isinstance(_parsed, dict) and "result" in _parsed:
+                    final_content = _parsed["result"]
+            except Exception:
+                try:
+                    import ast
+
+                    _parsed = ast.literal_eval(raw_content)
+                    if isinstance(_parsed, dict) and "result" in _parsed:
+                        final_content = _parsed["result"]
+                except Exception:
+                    pass
     elif reply.action_report:
         # Loop ended without terminate (max retries or timeout).
         # reply.content is raw LLM output containing ReAct prefixes.
@@ -4800,17 +4469,17 @@ Action Input: The JSON format of tool parameters
     else:
         final_content = reply.content or ""
 
+    final_answer = final_answer_assembler.finalize(final_content)
+
     # Persist AI reply with structured history payload
-    history_payload = json.dumps(
-        {
-            "version": 1,
-            "type": "react-agent",
-            "final_content": final_content,
-            "steps": history_steps,
-            "task_plan": list(_todo_list),
-            "generated_images": react_state.get("generated_images", []),
-        },
-        ensure_ascii=False,
+    history_payload = _build_react_history_payload(
+        final_content=final_answer.content,
+        steps=history_steps,
+        task_plan=list(_todo_list),
+        generated_images=react_state.get("generated_images", []),
+        sub_agents=build_subagent_history_snapshot(subagent_history),
+        input_files=input_files_snapshot,
+        citations=[citation.to_dict() for citation in final_answer.citations],
     )
     storage_conv.add_view_message(history_payload)
     storage_conv.end_current_round()
@@ -4818,6 +4487,12 @@ Action Input: The JSON format of tool parameters
 
     yield _sse_event({"type": "final", "content": final_content})
     yield _sse_event({"type": "done", "status": "done"})
+    for terminal_event in _react_terminal_events(
+        storage_conv,
+        history_payload,
+        final_answer,
+    ):
+        yield terminal_event
 
 
 # ---------------------------------------------------------------------------
@@ -4862,6 +4537,25 @@ def _get_conversation_service():
     return CFG.SYSTEM_APP.get_component(SERVE_SERVICE_COMPONENT_NAME, Service)
 
 
+def _conversation_owner_user_name(conv_uid: str) -> Optional[str]:
+    """Return the recorded owner (``user_name``) of a conversation.
+
+    ``None`` means the conversation does not exist, so callers can fail
+    closed. Legacy anonymous conversations return the stored blank value and
+    keep their previous share behavior.
+    """
+    from dbgpt.storage.chat_history.chat_history_db import ChatHistoryEntity
+
+    service = _get_conversation_service()
+    with service.dao.session(commit=False) as session:
+        entity = (
+            session.query(ChatHistoryEntity)
+            .filter(ChatHistoryEntity.conv_uid == conv_uid)
+            .first()
+        )
+    return None if entity is None else (entity.user_name or "")
+
+
 @router.post("/v1/chat/share", response_model=Result)
 async def create_share_link(
     body: ShareCreateRequest = Body(),
@@ -4871,10 +4565,21 @@ async def create_share_link(
 
     The returned ``share_url`` is a relative path that the client should
     prepend with the current host to form an absolute URL.
+
+    Ownership is verified first: a conversation recorded for another user
+    cannot be shared by a foreign (or anonymous) caller, and a conversation
+    that does not exist cannot be shared at all.
     """
+    from fastapi import HTTPException
+
+    requester = user_token.user_id if user_token else None
+    owner = _conversation_owner_user_name(body.conv_uid)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if owner and owner != (requester or ""):
+        raise HTTPException(status_code=403, detail="Not the conversation owner")
     dao = _get_share_dao()
-    created_by = user_token.user_id if user_token else None
-    entity = dao.create_share(conv_uid=body.conv_uid, created_by=created_by)
+    entity = dao.create_share(conv_uid=body.conv_uid, created_by=requester)
     if entity is None:
         return Result.failed(msg="Failed to create share link")
     return Result.succ(
@@ -4905,8 +4610,15 @@ async def get_share_conversation(token: str):
 
     history = service.get_history_messages(ServeRequest(conv_uid=link.conv_uid))
 
+    # Public viewers get scrubbed react history: v2 payloads have their
+    # ``input_files`` rewritten to non-resolvable public snapshots; v1
+    # payloads and plain-text messages are passed through unchanged.
     messages = [
-        {"role": m.role, "context": m.context, "order": m.order}
+        {
+            "role": m.role,
+            "context": scrub_react_history_for_share(m.context),
+            "order": m.order,
+        }
         for m in (history or [])
     ]
     return Result.succ(
@@ -4923,12 +4635,23 @@ async def delete_share_link(
     token: str,
     user_token: UserRequest = Depends(get_user_from_headers),
 ):
-    """Revoke a share link.  Only the owner (or any authenticated user) may delete."""
+    """Revoke a share link.
+
+    Only the recorded creator may delete a link; legacy anonymous shares
+    (no recorded creator) remain revocable by anyone. Foreign users get a
+    403 and unknown tokens a 404 — no share is silently dropped.
+    """
+    from fastapi import HTTPException
+
     dao = _get_share_dao()
+    link = dao.get_by_token(token)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    requester = user_token.user_id if user_token else None
+    if link.created_by and link.created_by != (requester or ""):
+        raise HTTPException(status_code=403, detail="Not the share owner")
     deleted = dao.delete_by_token(token)
     if not deleted:
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=404, detail="Share link not found")
     return Result.succ({"deleted": True, "token": token})
 
@@ -4936,6 +4659,7 @@ async def delete_share_link(
 @router.get("/v1/agent/files/download")
 async def download_agent_file(
     file_path: str = Query(..., description="Absolute path to the file to download"),
+    user_token: UserRequest = Depends(get_user_from_headers),
 ):
     """Download a file created by agent tools (shell_interpreter, code_interpreter).
 
@@ -4945,11 +4669,14 @@ async def download_agent_file(
     from fastapi import HTTPException
     from fastapi.responses import FileResponse
 
-    from dbgpt.configs.model_config import PILOT_PATH, ROOT_PATH
+    from dbgpt.configs.model_config import PILOT_PATH
 
-    # If path is not absolute, resolve relative to ROOT_PATH (sandbox working dir)
+    # Agent tools write their output here, so relative paths resolve against it
+    # rather than against the installation root.
+    agent_tmp_dir = os.path.join(PILOT_PATH, "tmp")
+
     if not os.path.isabs(file_path):
-        file_path = os.path.join(ROOT_PATH, file_path)
+        file_path = os.path.join(agent_tmp_dir, file_path)
 
     # Resolve to absolute path and prevent path traversal
     try:
@@ -4960,8 +4687,7 @@ async def download_agent_file(
     # Allowed base directories for agent-created files
     allowed_dirs = [
         os.path.realpath("/tmp"),
-        os.path.realpath(os.path.join(PILOT_PATH, "tmp")),
-        os.path.realpath(ROOT_PATH),
+        os.path.realpath(agent_tmp_dir),
     ]
 
     if not any(resolved.startswith(d + os.sep) or resolved == d for d in allowed_dirs):
@@ -5035,6 +4761,8 @@ async def chat_react_agent(
         dialogue.model_name,
     )
     dialogue.user_name = user_token.user_id if user_token else dialogue.user_name
+    # Pre-flight: 400/404 surface before the stream (and agent) is built.
+    attachment_ctx = await _open_turn_attachments(dialogue, user_token)
     headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -5042,12 +4770,17 @@ async def chat_react_agent(
         "Transfer-Encoding": "chunked",
     }
     try:
-        return StreamingResponse(
-            _react_agent_stream(dialogue),
+        return _AgentStreamingResponse(
+            _react_agent_stream(
+                dialogue, tool_mode="full", attachment_ctx=attachment_ctx
+            ),
             headers=headers,
             media_type="text/event-stream",
         )
     except Exception as e:
+        # The streaming generator never started, so its own cleanup never
+        # ran — drop the materialized turn files here before erroring out.
+        _close_turn_attachments_quietly(attachment_ctx)
         logger.exception("React Agent Exception!%s", dialogue, exc_info=e)
 
         async def error_text(err_msg):
@@ -5058,3 +4791,89 @@ async def chat_react_agent(
             headers=headers,
             media_type="text/plain",
         )
+
+
+@router.post("/v1/chat/knowledge-agent")
+async def chat_knowledge_agent(
+    dialogue: ConversationVo = Body(),
+    user_token: UserRequest = Depends(get_user_from_headers),
+):
+    """Knowledge-base chat agent — only kb tools + todowrite + terminate.
+
+    Optimized for pure knowledge-chat scenarios (no skill/shell/sql/html tools).
+    """
+    logger.info(
+        "chat_knowledge_agent:%s,%s,%s",
+        dialogue.chat_mode,
+        dialogue.select_param,
+        dialogue.model_name,
+    )
+    dialogue.user_name = user_token.user_id if user_token else dialogue.user_name
+    # Pre-flight: 400/404 surface before the stream (and agent) is built.
+    attachment_ctx = await _open_turn_attachments(dialogue, user_token)
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Transfer-Encoding": "chunked",
+    }
+    try:
+        return _AgentStreamingResponse(
+            _react_agent_stream(
+                dialogue, tool_mode="knowledge", attachment_ctx=attachment_ctx
+            ),
+            headers=headers,
+            media_type="text/event-stream",
+        )
+    except Exception as e:
+        # The streaming generator never started, so its own cleanup never
+        # ran — drop the materialized turn files here before erroring out.
+        _close_turn_attachments_quietly(attachment_ctx)
+        logger.exception("Knowledge Agent Exception!%s", dialogue, exc_info=e)
+
+        async def error_text(err_msg):
+            yield f"data:{err_msg}\n\n"
+
+        return StreamingResponse(
+            error_text(str(e)),
+            headers=headers,
+            media_type="text/plain",
+        )
+
+
+# ── Human-in-the-Loop Question API ──────────────────────────────────────────
+
+
+class _QuestionReplyBody(_BaseModel):
+    answers: List[List[str]]
+
+
+@router.post("/v1/chat/question/{request_id}/reply", response_model=Result)
+async def question_reply(
+    request_id: str,
+    body: _QuestionReplyBody,
+    user_token: UserRequest = Depends(get_user_from_headers),
+):
+    """User submits answers to a pending question, unblocking the agent tool."""
+    from dbgpt_app.openapi.api_v1.tools.question_manager import question_manager
+
+    try:
+        question_manager.reply(request_id, body.answers)
+        return Result.succ({"success": True, "request_id": request_id})
+    except KeyError as e:
+        return Result.failed(msg=str(e))
+
+
+@router.post("/v1/chat/question/{request_id}/reject", response_model=Result)
+async def question_reject(
+    request_id: str,
+    user_token: UserRequest = Depends(get_user_from_headers),
+):
+    """User dismisses a pending question, unblocking the agent tool with rejection."""
+    from dbgpt_app.openapi.api_v1.tools.question_manager import question_manager
+
+    try:
+        question_manager.reject(request_id)
+        return Result.succ({"success": True, "request_id": request_id})
+    except KeyError as e:
+        return Result.failed(msg=str(e))

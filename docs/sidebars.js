@@ -132,6 +132,7 @@ const sidebars = {
         { type: "doc", id: "awel/awel", label: "What is AWEL?" },
         { type: "doc", id: "agents/introduction/introduction", label: "Agents Overview" },
         { type: "doc", id: "modules/connections", label: "Connections Overview" },
+        { type: "doc", id: "modules/observability", label: "Observability Overview" },
       ],
     },
 
@@ -242,6 +243,11 @@ const sidebars = {
               items: [
                 { type: "doc", id: "agents/modules/resource/resource" },
                 { type: "doc", id: "agents/modules/resource/tools" },
+                {
+                  type: "doc",
+                  id: "agents/modules/resource/knowledge-source-connector",
+                  label: "Custom Knowledge Source Connector",
+                },
                 { type: "doc", id: "agents/modules/resource/database" },
                 { type: "doc", id: "agents/modules/resource/knowledge" },
                 { type: "doc", id: "agents/modules/resource/pack" },
@@ -267,7 +273,10 @@ const sidebars = {
       label: "Sandbox",
       collapsed: true,
       collapsible: true,
-      items: [{ type: "doc", id: "sandbox/index", label: "Overview" }],
+      items: [
+        { type: "doc", id: "sandbox/index", label: "Overview" },
+        { type: "doc", id: "sandbox/runtime", label: "Runtime Configuration" },
+      ],
     },
 
 
@@ -373,27 +382,6 @@ const sidebars = {
       collapsible: true,
       items: [
         { type: "doc", id: "modules/rag", label: "RAG Overview" },
-        {
-          type: "category",
-          label: "RAG Integrations",
-          collapsed: true,
-          items: [
-            { type: "doc", id: "installation/integrations/graph_rag_install" },
-            { type: "doc", id: "installation/integrations/oceanbase_rag_install" },
-            { type: "doc", id: "installation/integrations/bm25_rag_install" },
-            { type: "doc", id: "installation/integrations/milvus_rag_install" },
-          ],
-        },
-        {
-          type: "category",
-          label: "Cookbook",
-          collapsed: true,
-          items: [
-            { type: "doc", id: "cookbook/rag/graph_rag_app_develop" },
-            { type: "doc", id: "cookbook/rag/keyword_rag_app_develop" },
-            { type: "doc", id: "awel/cookbook/first_rag_with_awel" },
-          ],
-        },
       ],
     },
 
@@ -503,6 +491,7 @@ const sidebars = {
 
   sidebarStart: [
     { type: "doc", id: "overview", label: "Overview" },
+    { type: "doc", id: "getting-started/model-providers-ui", label: "Model Providers UI" },
     { type: "doc", id: "use_cases", label: "Show Cases" },
     {
       type: "category",
@@ -640,7 +629,10 @@ const sidebars = {
       ],
     },
   ],
-  sidebarSandbox: [{ type: "doc", id: "sandbox/index", label: "Overview" }],
+  sidebarSandbox: [
+    { type: "doc", id: "sandbox/index", label: "Overview" },
+    { type: "doc", id: "sandbox/runtime", label: "Runtime Configuration" },
+  ],
 
 
   sidebarAwel: [
@@ -740,31 +732,45 @@ const sidebars = {
   ],
 
   sidebarKnowledge: [
+    {
+      type: "category",
+      label: "Principles",
+      collapsed: false,
+      collapsible: false,
+      items: [
+        { type: "doc", id: "design/kb_index_principles", label: "Knowledge Base Indexing" },
+        { type: "doc", id: "design/agentic_rag_principles", label: "Agentic RAG Conversation" },
+      ],
+    },
+    {
+      type: "category",
+      label: "Usage Manual",
+      collapsed: false,
+      collapsible: true,
+      link: {
+        type: "doc",
+        id: "getting-started/web-ui/knowledge-base",
+      },
+      items: [
+        {
+          type: "doc",
+          id: "getting-started/web-ui/knowledge-base",
+          label: "Knowledge Base",
+        },
+        {
+          type: "doc",
+          id: "getting-started/web-ui/external-datasources",
+          label: "External Data Sources",
+        },
+        {
+          type: "doc",
+          id: "getting-started/web-ui/llm-wiki",
+          label: "LLM-Wiki",
+        },
+      ],
+    },
     { type: "doc", id: "modules/rag", label: "RAG Overview" },
     { type: "doc", id: "application/graph_rag", label: "GraphRAG" },
-    {
-      type: "category",
-      label: "RAG Integrations",
-      collapsed: false,
-      collapsible: false,
-      items: [
-        { type: "doc", id: "installation/integrations/graph_rag_install" },
-        { type: "doc", id: "installation/integrations/oceanbase_rag_install" },
-        { type: "doc", id: "installation/integrations/bm25_rag_install" },
-        { type: "doc", id: "installation/integrations/milvus_rag_install" },
-      ],
-    },
-    {
-      type: "category",
-      label: "Cookbook",
-      collapsed: false,
-      collapsible: false,
-      items: [
-        { type: "doc", id: "cookbook/rag/graph_rag_app_develop" },
-        { type: "doc", id: "cookbook/rag/keyword_rag_app_develop" },
-        { type: "doc", id: "awel/cookbook/first_rag_with_awel" },
-      ],
-    },
   ],
 
   sidebarTools: [
@@ -887,6 +893,11 @@ const sidebars = {
               items: [
                 { type: "doc", id: "agents/modules/resource/resource" },
                 { type: "doc", id: "agents/modules/resource/tools" },
+                {
+                  type: "doc",
+                  id: "agents/modules/resource/knowledge-source-connector",
+                  label: "Custom Knowledge Source Connector",
+                },
                 { type: "doc", id: "agents/modules/resource/database" },
                 { type: "doc", id: "agents/modules/resource/knowledge" },
                 { type: "doc", id: "agents/modules/resource/pack" },
@@ -959,6 +970,7 @@ const sidebars = {
       collapsed: false,
       items: [
         { type: "doc", id: "changelog/doc" },
+        { type: "doc", id: "changelog/Released_V0.8.2" },
         { type: "doc", id: "changelog/Released_V0.8.1" },
         { type: "doc", id: "changelog/Released_V0.8.0" },
         { type: "doc", id: "changelog/Released_V0.6.0" },
@@ -970,6 +982,7 @@ const sidebars = {
       label: "Upgrade",
       collapsed: false,
       items: [
+        { type: "doc", id: "upgrade/v0.8.2" },
         { type: "doc", id: "upgrade/v0.8.1" },
         { type: "doc", id: "upgrade/v0.8.0" },
         { type: "doc", id: "upgrade/v0.6.0" },

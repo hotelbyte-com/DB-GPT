@@ -1,9 +1,11 @@
+import html
 import logging
 import os
 import shutil
 from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi.responses import HTMLResponse
 
 from dbgpt._private.config import Config
 from dbgpt.configs import TAG_KEY_KNOWLEDGE_FACTORY_DOMAIN_TYPE
@@ -284,12 +286,12 @@ def chunk_strategies():
                         if strategy in knowledge.support_chunk_strategy()
                         and knowledge.document_type() is not None
                     ],
-                    "type": set(
-                        [
+                    "type": list(
+                        {
                             knowledge.type().value
                             for knowledge in KnowledgeFactory.subclasses()
                             if strategy in knowledge.support_chunk_strategy()
-                        ]
+                        }
                     ),
                 }
                 for strategy in ChunkStrategy
@@ -379,6 +381,61 @@ def graph_vis(space_name: str, query_request: GraphVisRequest):
         )
     except Exception as e:
         return Result.failed(code="E000X", msg=f"get graph vis error {e}")
+
+
+@router.get("/knowledge/{space_name}/codegraph/visualize")
+async def codegraph_visualize(space_name: str):
+    """Interactive HTML visualization of the code knowledge graph.
+
+    Returns a self-contained HTML page with vis-network force-directed graph.
+    Features: node coloring by type, community detection, search, click-to-inspect.
+    """
+    from dbgpt_serve.rag.tools.codegraph_tools import _load_graph
+
+    # space_name is a URL path param and flows into a filesystem join inside
+    # _load_graph → _get_graph_cache_dir. Reject path-traversal payloads up
+    # front (Binary/\\/..) rather than letting them build an out-of-tree path.
+    if (
+        not space_name
+        or "/" in space_name
+        or "\\" in space_name
+        or space_name
+        in (
+            ".",
+            "..",
+        )
+    ):
+        return HTMLResponse(
+            content="<html><body><h2>Invalid knowledge space name</h2></body></html>",
+            status_code=400,
+        )
+
+    graph, load_error = _load_graph(space_name)
+    if graph is None:
+        # Escape load_error before splicing into HTML — space_name is a
+        # user-controlled URL path param and the error message echoes it back,
+        # so an unescaped value is a reflected-XSS vector.
+        error_detail = f"<p>详情: {html.escape(load_error)}</p>" if load_error else ""
+        return HTMLResponse(
+            content="<html><body><h2>No code graph found</h2>"
+            "<p>请先构建代码图谱：创建知识库时启用代码图谱索引</p>"
+            f"{error_detail}</body></html>",
+            status_code=404,
+        )
+
+    try:
+        from dbgpt_ext.rag.graph_builder.codegraph_visualizer import codegraph_to_html
+
+        html_content = codegraph_to_html(graph, knowledge_id=space_name)
+        return HTMLResponse(content=html_content)
+    except Exception as e:
+        logger.error(f"codegraph_visualize error: {e}", exc_info=True)
+        # Escape the exception text to prevent reflected XSS via the error path.
+        return HTMLResponse(
+            content=f"<html><body><h2>Visualization Error</h2>"
+            f"<p>{html.escape(str(e))}</p></body></html>",
+            status_code=500,
+        )
 
 
 @router.post("/knowledge/{space_name}/document/delete")
@@ -520,6 +577,27 @@ def chunk_list(
 ):
     print(f"/chunk/list params: {space_name}, {query_request}")
     try:
+        # space_name is the authorization boundary for this endpoint: the
+        # chunk table has no space column, so the listing must be scoped
+        # through the named space's document ids. Never leave the query
+        # unrestricted here.
+        space = service.get({"name": space_name})
+        if space is None:
+            return Result.failed(
+                code="E000X",
+                msg=f"knowledge_space {space_name} can not be found",
+            )
+        doc_query = {"space": space.name}
+        if query_request.document_id is not None:
+            doc_query["id"] = query_request.document_id
+        documents = service.get_document_list(doc_query)
+        doc_ids = [doc.id for doc in documents]
+        if not doc_ids:
+            # No documents in this space (or the requested document id
+            # belongs to a different space): nothing can be listed.
+            return Result.succ(
+                ChunkQueryResponse(data=[], total=0, page=query_request.page)
+            )
         query = {
             "id": query_request.id,
             "document_id": query_request.document_id,
@@ -528,7 +606,10 @@ def chunk_list(
             "content": query_request.content,
         }
         chunk_res = service.get_chunk_list_page(
-            query, query_request.page, query_request.page_size
+            query,
+            query_request.page,
+            query_request.page_size,
+            document_ids=doc_ids,
         )
         res = ChunkQueryResponse(
             data=chunk_res.items,
@@ -548,6 +629,26 @@ def chunk_edit(
 ):
     print(f"/chunk/edit params: {space_name}, {edit_request}")
     try:
+        if not edit_request.chunk_id:
+            # A {"id": None} chunk query would list the whole chunk
+            # table — reject before touching the DAO.
+            return Result.failed(code="E000X", msg="chunk_id can not be empty")
+        # The target chunk must belong to the named space, otherwise a
+        # caller could modify chunks of any space by passing an arbitrary
+        # space_name in the path.
+        found = service.get_chunk_list({"id": edit_request.chunk_id})
+        if not found:
+            return Result.failed(
+                code="E000X",
+                msg=f"chunk {edit_request.chunk_id} can not be found",
+            )
+        document = service.get_document({"id": found[0].document_id})
+        if document is None or document.space != space_name:
+            return Result.failed(
+                code="E000X",
+                msg=f"chunk {edit_request.chunk_id} does not belong to "
+                f"knowledge_space {space_name}",
+            )
         serve_request = ChunkServeRequest(**edit_request.dict())
         serve_request.id = edit_request.chunk_id
         return Result.succ(service.update_chunk(request=serve_request))
@@ -555,9 +656,22 @@ def chunk_edit(
         return Result.failed(code="E000X", msg=f"document chunk edit error {e}")
 
 
-@router.post("/knowledge/{vector_name}/query")
-def similarity_query(space_name: str, query_request: KnowledgeQueryRequest):
+@router.post("/knowledge/{space_name}/query")
+def similarity_query(
+    space_name: str,
+    query_request: KnowledgeQueryRequest,
+    service: Service = Depends(get_rag_service),
+):
     print(f"Received params: {space_name}, {query_request}")
+    # The route historically declared {vector_name} while the handler
+    # read a *query* parameter named space_name, silently discarding the
+    # path value. The space in the path is authoritative and must exist.
+    space = service.get({"name": space_name})
+    if space is None:
+        return Result.failed(
+            code="E000X",
+            msg=f"knowledge_space {space_name} can not be found",
+        )
     storage_manager = StorageManager.get_instance(CFG.SYSTEM_APP)
     vector_store_connector = storage_manager.create_vector_store(index_name=space_name)
     retriever = EmbeddingRetriever(

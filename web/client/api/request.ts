@@ -50,7 +50,14 @@ import {
   ISyncBatchResponse,
   SpaceConfig,
 } from '@/types/knowledge';
-import { BaseModelParams, IModelData, StartModelParams, SupportModel } from '@/types/model';
+import {
+  BaseModelParams,
+  IModelData,
+  ModelProvider,
+  ProviderConfig,
+  StartModelParams,
+  SupportModel,
+} from '@/types/model';
 import { AxiosRequestConfig } from 'axios';
 import { DELETE, GET, POST, PUT } from '.';
 
@@ -199,59 +206,81 @@ export const getEditorSql = (id: string, round: string | number) => {
 
 /** knowledge */
 export const getArguments = (knowledgeName: string) => {
-  return POST<any, IArguments>(`/knowledge/${knowledgeName}/arguments`, {});
+  return POST<any, IArguments>(`/api/v1/knowledge/${knowledgeName}/arguments`, {});
 };
 export const saveArguments = (knowledgeName: string, data: ArgumentsParams) => {
-  return POST<ArgumentsParams, IArguments>(`/knowledge/${knowledgeName}/argument/save`, data);
+  return POST<ArgumentsParams, IArguments>(`/api/v1/knowledge/${knowledgeName}/argument/save`, data);
 };
 export const getRetrieveStrategyList = () => {
-  return POST<any, Array<IRetrieveStrategy>>(`/knowledge/retrieve_strategy_list`, {});
+  return POST<any, Array<IRetrieveStrategy>>(`/api/v1/knowledge/retrieve_strategy_list`, {});
 };
 
 export const getSpaceList = (data?: any) => {
-  return POST<any, Array<ISpace>>('/knowledge/space/list', data ?? {});
+  return POST<any, Array<ISpace>>('/api/v1/knowledge/space/list', data ?? {});
 };
 export const getDocumentList = (spaceName: string, data: Record<string, number | Array<number>>) => {
-  return POST<Record<string, number | Array<number>>, IDocumentResponse>(`/knowledge/${spaceName}/document/list`, data);
+  return POST<Record<string, number | Array<number>>, IDocumentResponse>(
+    `/api/v1/knowledge/${spaceName}/document/list`,
+    data,
+  );
 };
 export const getGraphVis = (spaceName: string, data: { limit: number }) => {
-  return POST<Record<string, number>, GraphVisResult>(`/knowledge/${spaceName}/graphvis`, data);
+  return POST<Record<string, number>, GraphVisResult>(`/api/v1/knowledge/${spaceName}/graphvis`, data);
+};
+
+export const getCodeGraphVisualizeHtml = (spaceName: string) => {
+  // This endpoint returns raw HTML, not JSON - use fetch directly.
+  // Note: we return the text even for 404 (no graph built yet) so the caller
+  // can surface the friendly "No code graph found" message from the backend
+  // instead of a raw HTTP error.
+  return fetch(`/api/v1/knowledge/${encodeURIComponent(spaceName)}/codegraph/visualize`, {
+    method: 'GET',
+  }).then(async response => {
+    const text = await response.text();
+    if (!response.ok && !text) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    return text;
+  });
 };
 
 export const addDocument = (knowledgeName: string, data: DocumentParams) => {
-  return POST<DocumentParams, number>(`/knowledge/${knowledgeName}/document/add`, data);
+  return POST<DocumentParams, number>(`/api/v1/knowledge/${knowledgeName}/document/add`, data);
 };
 
 export const addSpace = (data: AddKnowledgeParams) => {
-  return POST<AddKnowledgeParams, number>(`/knowledge/space/add`, data);
+  return POST<AddKnowledgeParams, number>(`/api/v1/knowledge/space/add`, data);
 };
 
 export const getChunkStrategies = () => {
-  return GET<null, Array<IChunkStrategyResponse>>('/knowledge/document/chunkstrategies');
+  return GET<null, Array<IChunkStrategyResponse>>('/api/v1/knowledge/document/chunkstrategies');
 };
 
 export const syncDocument = (spaceName: string, data: Record<string, Array<number>>) => {
-  return POST<Record<string, Array<number>>, string | null>(`/knowledge/${spaceName}/document/sync`, data);
+  return POST<Record<string, Array<number>>, string | null>(`/api/v1/knowledge/${spaceName}/document/sync`, data);
 };
 
 export const syncBatchDocument = (spaceName: string, data: Array<ISyncBatchParameter>) => {
-  return POST<Array<ISyncBatchParameter>, ISyncBatchResponse>(`/knowledge/${spaceName}/document/sync_batch`, data);
+  return POST<Array<ISyncBatchParameter>, ISyncBatchResponse>(
+    `/api/v1/knowledge/${spaceName}/document/sync_batch`,
+    data,
+  );
 };
 
 export const uploadDocument = (knowLedgeName: string, data: FormData) => {
-  return POST<FormData, number>(`/knowledge/${knowLedgeName}/document/upload`, data);
+  return POST<FormData, number>(`/api/v1/knowledge/${knowLedgeName}/document/upload`, data);
 };
 
 export const getChunkList = (spaceName: string, data: ChunkListParams) => {
-  return POST<ChunkListParams, IChunkList>(`/knowledge/${spaceName}/chunk/list`, data);
+  return POST<ChunkListParams, IChunkList>(`/api/v1/knowledge/${spaceName}/chunk/list`, data);
 };
 
 export const delDocument = (spaceName: string, data: Record<string, number>) => {
-  return POST<Record<string, number>, null>(`/knowledge/${spaceName}/document/delete`, data);
+  return POST<Record<string, number>, null>(`/api/v1/knowledge/${spaceName}/document/delete`, data);
 };
 
 export const delSpace = (data: Record<string, string>) => {
-  return POST<Record<string, string>, null>(`/knowledge/space/delete`, data);
+  return POST<Record<string, string>, null>(`/api/v1/knowledge/space/delete`, data);
 };
 
 /** models */
@@ -276,6 +305,95 @@ export const startModel = (data: BaseModelParams) => {
 
 export const getSupportModels = () => {
   return GET<null, Array<SupportModel>>('/api/v2/serve/model/model-types');
+};
+
+// List model providers and their supported models (two-level catalog)
+export const getModelProviders = (workerType?: string) => {
+  return GET<{ worker_type?: string }, Array<ModelProvider>>('/api/v2/serve/model/providers', {
+    worker_type: workerType,
+  });
+};
+
+// Provider ids contain "/" (e.g. "proxy/openai"), so pass them as query/body
+// parameters instead of path segments to avoid route-matching issues.
+
+// Get the stored provider configuration (connection state + enabled models)
+export const getProviderConfig = (provider: string) => {
+  return GET<{ provider: string }, ProviderConfig>('/api/v2/serve/model/providers/config', { provider });
+};
+
+// Save provider credentials (connect the provider)
+export const saveProviderConfig = (provider: string, data: { api_key?: string; api_base?: string }) => {
+  return PUT<{ provider: string; api_key?: string; api_base?: string }, boolean>(
+    '/api/v2/serve/model/providers/config',
+    { provider, ...data },
+  );
+};
+
+// Connect a provider and auto-enable all of its models
+export const connectModelProvider = (provider: string, data: { api_key?: string; api_base?: string }) => {
+  return POST<
+    { provider: string; api_key?: string; api_base?: string },
+    { connected: boolean; enabled_models: string[] }
+  >('/api/v2/serve/model/providers/connect', { provider, ...data });
+};
+
+// Disconnect a provider: stop its enabled models and clear its key
+export const disconnectModelProvider = (provider: string) => {
+  return POST<{ provider: string }, boolean>('/api/v2/serve/model/providers/disconnect', { provider });
+};
+
+// Create a custom OpenAI-compatible provider (no code change required)
+export const createCustomProvider = (data: { label: string; api_base: string; api_key: string; models: string[] }) => {
+  return POST<typeof data, { provider: string; label: string; enabled_models: string[] }>(
+    '/api/v2/serve/model/providers/custom',
+    data,
+  );
+};
+
+// Save the enabled model list under a provider (enable/disable models)
+export const saveProviderEnabledModels = (provider: string, enabled_models: string[]) => {
+  return PUT<{ provider: string; enabled_models: string[] }, boolean>('/api/v2/serve/model/providers/models', {
+    provider,
+    enabled_models,
+  });
+};
+
+// Enable a model: start its proxy worker so it becomes a usable model
+export const enableProviderModel = (provider: string, model: string) => {
+  return POST<{ provider: string; model: string }, boolean>('/api/v2/serve/model/providers/models/enable', {
+    provider,
+    model,
+  });
+};
+
+// GitHub Copilot OAuth device flow: request a user code, then poll until the
+// user has authorized at github.com/login/device (same flow as opencode).
+export type CopilotDeviceCode = {
+  verification_uri: string;
+  user_code: string;
+  device_code: string;
+  interval: number;
+};
+
+export type CopilotPollResult = { status: 'success' | 'pending' | 'slow_down'; enabled_models?: string[] };
+
+export const copilotAuthStart = () => {
+  return POST<void, CopilotDeviceCode>('/api/v2/serve/model/providers/github_copilot/auth/start', undefined as never);
+};
+
+export const copilotAuthPoll = (deviceCode: string) => {
+  return GET<{ device_code: string }, CopilotPollResult>('/api/v2/serve/model/providers/github_copilot/auth/poll', {
+    device_code: deviceCode,
+  });
+};
+
+// Disable a model: stop its proxy worker
+export const disableProviderModel = (provider: string, model: string) => {
+  return POST<{ provider: string; model: string }, boolean>('/api/v2/serve/model/providers/models/disable', {
+    provider,
+    model,
+  });
 };
 
 /** Agent */
@@ -418,10 +536,10 @@ export const modelSearch = (data: Record<string, string>) => {
 };
 
 export const getKnowledgeAdmins = (spaceId: string) => {
-  return GET<string, Record<string, any>>(`/knowledge/users/list?space_id=${spaceId}`);
+  return GET<string, Record<string, any>>(`/api/v1/knowledge/users/list?space_id=${spaceId}`);
 };
 export const updateKnowledgeAdmins = (data: Record<string, string>) => {
-  return POST<Record<string, any>, any[]>(`/knowledge/users/update`, data);
+  return POST<Record<string, any>, any[]>(`/api/v1/knowledge/users/update`, data);
 };
 
 /** AWEL Flow */
@@ -432,5 +550,5 @@ export const delApp = (data: Record<string, string>) => {
 };
 
 export const getSpaceConfig = () => {
-  return GET<string, SpaceConfig>(`/knowledge/space/config`);
+  return GET<string, SpaceConfig>(`/api/v1/knowledge/space/config`);
 };

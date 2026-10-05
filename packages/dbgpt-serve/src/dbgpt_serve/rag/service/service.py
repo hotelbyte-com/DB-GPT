@@ -232,16 +232,17 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                 )
             chunk_parameters = sync_request.chunk_parameters
             if chunk_parameters.chunk_strategy != ChunkStrategy.CHUNK_BY_SIZE.name:
-                space_context = self.get_space_context(space_id)
+                space_context = self.get_space_context(space_id) or {}
+                embedding_ctx = space_context.get("embedding") or {}
                 chunk_parameters.chunk_size = (
                     self._serve_config.chunk_size
-                    if space_context is None
-                    else int(space_context["embedding"]["chunk_size"])
+                    if not embedding_ctx.get("chunk_size")
+                    else int(embedding_ctx["chunk_size"])
                 )
                 chunk_parameters.chunk_overlap = (
                     self._serve_config.chunk_overlap
-                    if space_context is None
-                    else int(space_context["embedding"]["chunk_overlap"])
+                    if not embedding_ctx.get("chunk_overlap")
+                    else int(embedding_ctx["chunk_overlap"])
                 )
             await self._sync_knowledge_document(space_id, doc, chunk_parameters)
             doc_ids.append(doc.id)
@@ -369,6 +370,17 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
         self._chunk_dao.raw_delete(docuemnt.id)
         # delete document
         self._document_dao.raw_delete(docuemnt)
+        # LLM-Wiki: schedule reference rework for pages citing this document
+        try:
+            from ..service.wiki.config import wiki_enabled
+            from ..service.wiki.task_scheduler import get_wiki_scheduler
+
+            if wiki_enabled(space):
+                _scheduler = get_wiki_scheduler()
+                if _scheduler is not None:
+                    _scheduler.enqueue_reconcile(space.id, docuemnt.id)
+        except Exception as wiki_err:
+            logger.warning(f"wiki reconcile enqueue failed: {wiki_err}")
         return docuemnt
 
     def get_list(self, request: SpaceServeRequest) -> List[SpaceServeResponse]:
@@ -430,12 +442,50 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
         """
         return self._document_dao.get_list_page(request, page, page_size)
 
-    def get_chunk_list_page(self, request: QUERY_SPEC, page: int, page_size: int):
+    def get_chunk_list_page(
+        self,
+        request: QUERY_SPEC,
+        page: int,
+        page_size: int,
+        document_ids: List[int] = None,
+    ):
         """get document chunks with page
         Args:
             - request: QUERY_SPEC
+            - document_ids: optional list of document ids that scopes the
+              chunks to one knowledge space (the chunk table has no space
+              column of its own, so a space is its set of document ids).
+
+        Without document_ids the page query is unrestricted (kept for
+        callers that deliberately list across spaces).
         """
-        return self._chunk_dao.get_list_page(request, page, page_size)
+        if document_ids is None:
+            return self._chunk_dao.get_list_page(request, page, page_size)
+        if len(document_ids) == 0:
+            # The space exists but owns no documents.
+            return PaginationResult(
+                items=[],
+                total_count=0,
+                total_pages=0,
+                page=page,
+                page_size=page_size,
+            )
+        entity = self._chunk_dao.from_request(request)
+        items = self._chunk_dao.get_document_chunks(
+            entity, page, page_size, document_ids
+        )
+        count = self._chunk_dao.get_document_chunks_count(
+            entity, document_ids=document_ids
+        )
+        items_res = [self._chunk_dao.to_response(item) for item in items]
+        total_pages = (count + page_size - 1) // page_size
+        return PaginationResult(
+            items=items_res,
+            total_count=count,
+            total_pages=total_pages,
+            page=page,
+            page_size=page_size,
+        )
 
     def get_chunk_list(self, request: QUERY_SPEC):
         """get document chunks
@@ -448,8 +498,15 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
         """update knowledge document chunk"""
         if not request.id:
             raise Exception("chunk_id is required")
-        chunk = self._chunk_dao.get_one({"id": request.id})
-        entity = self._chunk_dao.from_response(chunk)
+        # Fetch the entity directly instead of the response DTO: the
+        # get_one → from_response round-trip converts gmt_* to strings,
+        # which session.merge rejects on SQLite.
+        chunks = self._chunk_dao.get_document_chunks(
+            DocumentChunkEntity(id=request.id), 1, 1
+        )
+        if not chunks:
+            raise Exception(f"chunk {request.id} can not be found")
+        entity = chunks[0]
         if request.content:
             entity.content = request.content
         if request.questions:
@@ -457,6 +514,7 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                 remove_trailing_punctuation(question) for question in request.questions
             ]
             entity.questions = json.dumps(questions, ensure_ascii=False)
+        entity.gmt_modified = datetime.now()
         self._chunk_dao.update_chunk(entity)
 
     async def _batch_document_sync(
@@ -486,16 +544,17 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                 )
             chunk_parameters = sync_request.chunk_parameters
             if chunk_parameters.chunk_strategy != ChunkStrategy.CHUNK_BY_SIZE.name:
-                space_context = self.get_space_context(space_id)
+                space_context = self.get_space_context(space_id) or {}
+                embedding_ctx = space_context.get("embedding") or {}
                 chunk_parameters.chunk_size = (
                     self._serve_config.chunk_size
-                    if space_context is None
-                    else int(space_context["embedding"]["chunk_size"])
+                    if not embedding_ctx.get("chunk_size")
+                    else int(embedding_ctx["chunk_size"])
                 )
                 chunk_parameters.chunk_overlap = (
                     self._serve_config.chunk_overlap
-                    if space_context is None
-                    else int(space_context["embedding"]["chunk_overlap"])
+                    if not embedding_ctx.get("chunk_overlap")
+                    else int(embedding_ctx["chunk_overlap"])
                 )
             await self._sync_knowledge_document(space_id, doc, chunk_parameters)
             doc_ids.append(doc.id)
@@ -513,6 +572,17 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
             space.name, space.vector_type
         )
         knowledge_content = doc.content
+        # Self-heal: knowledge-source (external platform) docs are content-
+        # based and live in doc_type TEXT — the ingest adapter retypes them,
+        # but rows created/failing before that fix may still say DOCUMENT.
+        # Retag here so the file-view sync button heals them too, instead of
+        # dispatching from_file_path on extensionless markdown content.
+        if (
+            doc.doc_type == KnowledgeType.DOCUMENT.value
+            and not knowledge_content.startswith(_SCHEMA)
+            and (doc.result or "").startswith("knowledge-source")
+        ):
+            doc.doc_type = KnowledgeType.TEXT.value
         if (
             doc.doc_type == KnowledgeType.DOCUMENT.value
             and knowledge_content.startswith(_SCHEMA)
@@ -530,8 +600,9 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
             logger.info(f"Downloaded file to {local_file_path}")
             knowledge_content = local_file_path
         knowledge = None
+        domain_type = (space.domain_type or "normal").lower()
         if not space.domain_type or (
-            space.domain_type.lower() == BusinessFieldType.NORMAL.value.lower()
+            domain_type == BusinessFieldType.NORMAL.value.lower()
         ):
             knowledge = KnowledgeFactory.create(
                 datasource=knowledge_content,
@@ -580,7 +651,13 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                 metadata={"doc": doc.doc_name},
             ):
                 from dbgpt.core.awel import BaseOperator
+                from dbgpt_serve.rag.domain.factory import DomainKnowledgeIndexFactory
 
+                domain_type = (space.domain_type or "normal").lower()
+                chunk_docs = None
+                vector_ids = None
+
+                # Check if there's a custom AWEL DAG for this domain type
                 dags = self.dag_manager.get_dags_by_tag(
                     TAG_KEY_KNOWLEDGE_FACTORY_DOMAIN_TYPE, space.domain_type
                 )
@@ -595,6 +672,49 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                     )
                     doc.chunk_size = len(chunk_docs)
                     vector_ids = [chunk.chunk_id for chunk in chunk_docs]
+                elif domain_type != "normal" and knowledge is not None:
+                    # Use DomainKnowledgeIndex for non-normal domain types
+                    try:
+                        domain_index = DomainKnowledgeIndexFactory.create(domain_type)
+                        logger.info(
+                            f"Using DomainKnowledgeIndex for domain_type={domain_type}"
+                        )
+                        max_chunks_once_load = self.config.max_chunks_once_load
+                        max_threads = self.config.max_threads
+
+                        # ETL pipeline: extract → transform → load
+                        chunks = await domain_index.extract(knowledge, chunk_parameters)
+                        chunks = await domain_index.transform(chunks)
+                        chunks = await domain_index.load(
+                            chunks,
+                            vector_store=storage_connector,
+                            max_chunks_once_load=max_chunks_once_load,
+                            max_threads=max_threads,
+                        )
+                        chunk_docs = chunks
+                        doc.chunk_size = len(chunk_docs)
+                        vector_ids = [chunk.chunk_id for chunk in chunk_docs]
+                    except Exception as domain_err:
+                        logger.warning(
+                            f"DomainKnowledgeIndex failed for "
+                            f"domain_type={domain_type}, "
+                            f"falling back to EmbeddingAssembler: {domain_err}"
+                        )
+                        # Fallback to default EmbeddingAssembler
+                        max_chunks_once_load = self.config.max_chunks_once_load
+                        max_threads = self.config.max_threads
+                        assembler = await EmbeddingAssembler.aload_from_knowledge(
+                            knowledge=knowledge,
+                            index_store=storage_connector,
+                            chunk_parameters=chunk_parameters,
+                        )
+                        chunk_docs = assembler.get_chunks()
+                        doc.chunk_size = len(chunk_docs)
+                        vector_ids = await assembler.apersist(
+                            max_chunks_once_load=max_chunks_once_load,
+                            max_threads=max_threads,
+                            file_id=doc.id,
+                        )
                 else:
                     max_chunks_once_load = self.config.max_chunks_once_load
                     max_threads = self.config.max_threads
@@ -631,6 +751,37 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
                 for chunk_doc in chunk_docs
             ]
             self._chunk_dao.create_documents_chunks(chunk_entities)
+            # Build markdown heading graph if the space has KnowledgeGraph index
+            # method and the document is a markdown file. This runs after chunks
+            # are persisted so the graph builder can reconstruct file content.
+            await self._maybe_build_heading_graph(space, doc)
+            # LLM-Wiki: enqueue a debounced wiki ingest when the space has the
+            # Wiki index method. Enqueue failures never fail the doc sync.
+            #
+            # NOTE: the wiki gate intentionally re-reads the space ENTITY via
+            # the DAO instead of trusting the ``space`` argument — the latter
+            # is a SpaceServeResponse whose shape has historically lacked
+            # index_methods/context, which silently killed auto-generation
+            # (users had to press Generate manually).
+            try:
+                from ..models.models import (
+                    KnowledgeSpaceDao,
+                    KnowledgeSpaceEntity,
+                )
+                from ..service.wiki.config import wiki_enabled
+                from ..service.wiki.task_scheduler import get_wiki_scheduler
+
+                dao = KnowledgeSpaceDao()
+
+                _entities = dao.get_knowledge_space(
+                    KnowledgeSpaceEntity(name=space.name)
+                )
+                if _entities and wiki_enabled(_entities[0]):
+                    _scheduler = get_wiki_scheduler()
+                    if _scheduler is not None:
+                        _scheduler.enqueue_ingest(_entities[0].id, [doc.id])
+            except Exception as wiki_err:
+                logger.warning(f"wiki ingest enqueue failed: {wiki_err}", exc_info=True)
         except Exception as e:
             import traceback
 
@@ -640,6 +791,57 @@ class Service(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeRes
             logger.error(f"document embedding, failed:{doc.doc_name}, {str(e)}")
             logger.error(f"Full traceback:\n{error_traceback}")
         return self._document_dao.update_knowledge_document(doc)
+
+    async def _maybe_build_heading_graph(self, space, doc) -> None:
+        """Build a markdown heading graph for the document if applicable.
+
+        Triggered automatically when:
+        - The knowledge space has "KnowledgeGraph" in its index_methods
+        - The document is a markdown file (.md / .markdown)
+
+        The graph is built by reconstructing the file content from its chunks
+        and extracting the heading hierarchy (H1 -> H2 -> H3). The result is
+        merged with any existing graph and persisted via the codegraph store.
+        Failures are logged but do not affect the document sync status.
+        """
+        try:
+            # 1. Resolve the space entity to read index_methods
+            space_entities = self._dao.get_knowledge_space(
+                KnowledgeSpaceEntity(name=space.name)
+            )
+            if not space_entities:
+                return
+            space_entity = space_entities[0]
+
+            # 2. Parse index_methods
+            index_methods = []
+            if space_entity.index_methods:
+                try:
+                    index_methods = json.loads(space_entity.index_methods)
+                except (json.JSONDecodeError, TypeError):
+                    index_methods = []
+            if "KnowledgeGraph" not in index_methods:
+                return
+
+            # 3. Check if the document is a markdown file
+            doc_name = (doc.doc_name or "").lower()
+            if not (doc_name.endswith(".md") or doc_name.endswith(".markdown")):
+                return
+
+            # 4. Build the heading graph from the document's chunks
+            from ..service.codegraph_build_service import (
+                build_code_graph_from_knowledge_space,
+            )
+
+            result = await build_code_graph_from_knowledge_space(space_entity.name)
+            if result:
+                logger.info(
+                    f"Built heading graph for {doc.doc_name}: "
+                    f"{result.get('vertices', 0)} vertices, "
+                    f"{result.get('edges', 0)} edges"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to build heading graph for {doc.doc_name}: {e}")
 
     def get_space_context(self, space_id):
         """get space contect

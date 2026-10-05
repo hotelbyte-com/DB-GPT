@@ -108,7 +108,7 @@ def _initialize_resource_manager(system_app: SystemApp):
         get_current_host_memory_status,
         get_current_host_system_load,
     )
-    from dbgpt.agent.expand.resources.search_tool import baidu_search
+    from dbgpt.agent.expand.resources.search_tool import baidu_search, serply_search
     from dbgpt.agent.resource.base import ResourceType
     from dbgpt_ext.datasource.tool_repo_rg import repo_rg
     from dbgpt_ext.datasource.tool_redis import (
@@ -145,6 +145,7 @@ def _initialize_resource_manager(system_app: SystemApp):
     rm.register_resource(resource_instance=Terminate())
     # Register a search tool
     rm.register_resource(resource_instance=baidu_search)
+    rm.register_resource(resource_instance=serply_search)
     rm.register_resource(resource_instance=list_dbgpt_support_models)
     # Register host tools
     rm.register_resource(resource_instance=get_current_host_cpu_status)

@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Type, Union
 
-from jinja2 import Environment, Template, meta
+from jinja2 import Environment, meta
 from jinja2.sandbox import SandboxedEnvironment
 
 from dbgpt._private.pydantic import BaseModel, ConfigDict, Field
@@ -118,7 +118,9 @@ class Role(ABC, BaseModel):
         """Get agent prompt template."""
         self.language = language
         system_prompt = self.current_profile.get_system_prompt_template()
-        template = Template(system_prompt)
+        # Render via the sandboxed environment to prevent SSTI from any
+        # user-controlled content that reaches the system prompt template.
+        template = self.template_env.from_string(system_prompt)
 
         env = Environment()
         parsed_content = env.parse(system_prompt)
@@ -317,6 +319,16 @@ class Role(ABC, BaseModel):
         )
         observation = check_fail_reason or action_output.observations
 
+        # When the tool result was persisted to disk (oversized output),
+        # ``content`` holds the <persisted-output> preview block (with file
+        # path) and ``observations`` holds the full content. Store the preview
+        # block in memory so read_memories reconstructs a size-bounded
+        # Observation instead of the full output. The full content remains
+        # available on disk via the persisted_path / snapshot_path.
+        persisted_path = getattr(action_output, "persisted_path", None)
+        if persisted_path and not check_fail_reason:
+            observation = action_output.content
+
         memory_map = {
             "thought": mem_thoughts,
             "action": action,
@@ -330,6 +342,8 @@ class Role(ABC, BaseModel):
             memory_map["action_intention"] = action_intention
         if action_reason:
             memory_map["action_reason"] = action_reason
+        if persisted_path:
+            memory_map["persisted_path"] = persisted_path
 
         if current_retry_counter is not None and current_retry_counter == 0:
             memory_map["question"] = question

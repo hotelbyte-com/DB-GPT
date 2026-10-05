@@ -18,7 +18,7 @@ async def create_flow(client: Client, flow: FlowPanel) -> FlowPanel:
         flow (FlowPanel): The flow panel.
     """
     try:
-        res = await client.get("/awel/flows", flow.to_dict())
+        res = await client.post("/awel/flows", flow.to_dict())
         result: Result = res.json()
         if result["success"]:
             return FlowPanel(**result["data"])
@@ -40,14 +40,18 @@ async def update_flow(client: Client, flow: FlowPanel) -> FlowPanel:
         ClientException: If the request failed.
     """
     try:
-        res = await client.put("/awel/flows", flow.to_dict())
+        if not flow.uid:
+            raise ClientException(reason="Failed to update flow: flow.uid is required")
+        res = await client.put(f"/awel/flows/{flow.uid}", flow.to_dict())
         result: Result = res.json()
         if result["success"]:
             return FlowPanel(**result["data"])
         else:
             raise ClientException(status=result["err_code"], reason=result)
+    except ClientException:
+        raise
     except Exception as e:
-        raise ClientException(f"Failed to update flow: {e}")
+        raise ClientException(reason=f"Failed to update flow: {e}") from e
 
 
 async def delete_flow(client: Client, flow_id: str) -> FlowPanel:

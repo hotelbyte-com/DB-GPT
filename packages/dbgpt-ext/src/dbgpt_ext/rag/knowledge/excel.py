@@ -32,7 +32,7 @@ class ExcelKnowledge(Knowledge):
         Args:
             file_path(str,  optional): file path
             knowledge_type(KnowledgeType, optional): knowledge type
-            source_column(str, optional): source column
+            source_columns (str, optional): source column
             encoding(str, optional): csv encoding
             loader(Any, optional): loader
         """
@@ -126,7 +126,9 @@ class ExcelKnowledge(Knowledge):
         try:
             import openpyxl
 
-            workbook = openpyxl.load_workbook(self._path)
+            # data_only reads the result Excel saved for a formula cell, not the
+            # formula text, the same as pandas.read_excel.
+            workbook = openpyxl.load_workbook(self._path, data_only=True)
         except Exception as e:
             raise IOError(f"Could not load Excel file with openpyxl: {e}")
 
@@ -175,6 +177,7 @@ class ExcelKnowledge(Knowledge):
                 )
             else:
                 data_rows = unmerged_data
+                df_start_row_index = 0
                 logging.info(
                     f"Sheet '{sheet_name}': No clear header row found. "
                     f"All rows considered data."
@@ -261,7 +264,7 @@ class ExcelKnowledge(Knowledge):
                 )
                 docs.append(doc)
 
-            return docs
+        return docs
 
     @classmethod
     def support_chunk_strategy(cls) -> List[ChunkStrategy]:

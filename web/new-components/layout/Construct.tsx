@@ -1,13 +1,11 @@
-import { ModelSvg } from '@/components/icons';
-import Icon, {
+import {
   ApiOutlined,
   AppstoreOutlined,
-  BuildOutlined,
   ClockCircleOutlined,
   ConsoleSqlOutlined,
   ForkOutlined,
-  MessageOutlined,
   PartitionOutlined,
+  SettingOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
 import { ConfigProvider, Tabs } from 'antd';
@@ -40,10 +38,10 @@ function ConstructLayout({ children, className }: { children: React.ReactNode; c
       path: '/flow',
     },
     {
-      key: 'models',
-      name: t('model_manage'),
-      path: '/models',
-      icon: <Icon component={ModelSvg} />,
+      key: 'models-config',
+      name: t('model_provider_config'),
+      path: '/models-config',
+      icon: <SettingOutlined />,
     },
     {
       key: 'database',
@@ -64,12 +62,6 @@ function ConstructLayout({ children, className }: { children: React.ReactNode; c
     //   icon: <BuildOutlined />,
     // },
     {
-      key: 'prompt',
-      name: t('Prompt'),
-      icon: <MessageOutlined />,
-      path: '/prompt',
-    },
-    {
       key: 'skills',
       name: t('skills') || '技能',
       path: '/skills',
@@ -87,12 +79,18 @@ function ConstructLayout({ children, className }: { children: React.ReactNode; c
       icon: <ClockCircleOutlined />,
       path: '/scheduled-tasks',
     },
-    {
-      key: 'dbgpts',
-      name: t('dbgpts_community'),
-      path: '/dbgpts',
-      icon: <BuildOutlined />,
-    },
+    // {
+    //   key: 'prompt',
+    //   name: t('Prompt'),
+    //   icon: <MessageOutlined />,
+    //   path: '/prompt',
+    // },
+    // {
+    //   key: 'dbgpts',
+    //   name: t('dbgpts_community'),
+    //   path: '/dbgpts',
+    //   icon: <BuildOutlined />,
+    // },
   ];
   const router = useRouter();
   const activeKey = router.pathname.split('/')[2];
